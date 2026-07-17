@@ -1,8 +1,0 @@
-﻿{
-  "profiles": {
-    "TouchChanX": {
-      "commandName": "Project",
-      "commandLineArgs": "\"C:\\Windows\\notepad.exe\""
-    }
-  }
-}

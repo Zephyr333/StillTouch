@@ -431,5 +431,6 @@ FodyWeavers.xsd
 # MacOS useless file
 .DS_Store
 
-# shell menu handler dll
-TouchChanX.Package/TouchChanX.ShellMenuHandler.dll
+# Locally published single-file executable
+/EXE/
+

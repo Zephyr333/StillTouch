@@ -1,0 +1,18 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/SolutionFolder/">
+    <File Path=".editorconfig" />
+    <File Path=".gitignore" />
+    <File Path="AGENTS.md" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="LICENSE.txt" />
+    <File Path="NOTICE.md" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="StillTouch.Core/StillTouch.Core.csproj" />
+  <Project Path="StillTouch/StillTouch.csproj" />
+  <Project Path="StillTouch.Tests/StillTouch.Tests.csproj" />
+</Solution>

@@ -17,7 +17,9 @@
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyName>StillTouch</AssemblyName>
     <RootNamespace>StillTouch</RootNamespace>
-    <Version>1.1.1</Version>
+    <Version>1.1.1-rc.2</Version>
+    <AssemblyVersion>1.1.1.0</AssemblyVersion>
+    <FileVersion>1.1.1.0</FileVersion>
     <Product>StillTouch</Product>
     <Description>Convert confirmed stationary single-finger touch gestures into mouse clicks.</Description>
     <Authors>Zephyr333</Authors>

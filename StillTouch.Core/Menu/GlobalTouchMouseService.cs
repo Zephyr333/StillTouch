@@ -102,13 +102,19 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     public void EnterFailOpenMode()
     {
-        _acceptingInput = false;
+        StopAcceptingInput();
         CancelLongPressTimer();
 
         // A partially replayed drag must never survive disabling or process shutdown. Releasing
         // both buttons is idempotent and also recovers from a partial SendInput sequence.
         _ = AbsoluteMouseInput.ReleaseButtons();
     }
+
+    /// <summary>
+    /// Stops suppressing input without calling any native cleanup API. This is safe to call from
+    /// inside a tray or input callback; full disposal must happen after that callback unwinds.
+    /// </summary>
+    public void StopAcceptingInput() => _acceptingInput = false;
 
     private LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
     {

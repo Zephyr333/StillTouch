@@ -58,6 +58,7 @@ SendInput
 MapVirtualKey
 SetCursorPos
 GetPointerInfo
+GetPointerDeviceRects
 CallWindowProc
 RegisterRawInputDevices
 GetRawInputData

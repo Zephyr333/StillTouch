@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using R3;
 using StillTouch.Core.Interop;
 using Windows.Win32;
@@ -29,8 +30,11 @@ public readonly record struct TouchContactSnapshot(
         nowMilliseconds - UpdatedAtMilliseconds <= maximumAgeMilliseconds;
 }
 
+[SupportedOSPlatform("windows8.0")]
 public sealed class GestureRecognitionService : IDisposable
 {
+    internal const uint LongPressTimerMessage = 0x8000 + 0x53;
+
     private const uint WM_INPUT = 0x00FF;
     private const uint WM_INPUT_DEVICE_CHANGE = 0x00FE;
     private const uint WM_POINTERUPDATE = 0x0245;
@@ -69,6 +73,10 @@ public sealed class GestureRecognitionService : IDisposable
     public TouchContactSnapshot CurrentTouchSnapshot { get; private set; }
 
     public event Action<TouchContactSnapshot>? TouchSnapshotChanged;
+
+    internal event Action<TouchContactChange>? TouchContactChanged;
+
+    internal event Action<long>? LongPressTimerElapsed;
 
     internal System.Drawing.Point LastGesturePosition { get; private set; }
 
@@ -115,6 +123,7 @@ public sealed class GestureRecognitionService : IDisposable
 
             _isEnabled = value;
             ResetCapture();
+            PublishTouchReset();
         }
     }
 
@@ -147,7 +156,7 @@ public sealed class GestureRecognitionService : IDisposable
                     case WM_INPUT_DEVICE_CHANGE:
                         _validRawInputDevices.Clear();
                         ResetCapture();
-                        PublishTouchSnapshot();
+                        PublishTouchReset();
                         break;
                     case WM_POINTERDOWN:
                         HandlePointerDown(GetPointerId(wParam), TryGetPointerPoint(wParam, out var downPoint) ? downPoint : null);
@@ -160,7 +169,10 @@ public sealed class GestureRecognitionService : IDisposable
                         break;
                     case WM_POINTERCAPTURECHANGED:
                         ResetCapture();
-                        PublishTouchSnapshot();
+                        PublishTouchReset();
+                        break;
+                    case LongPressTimerMessage:
+                        LongPressTimerElapsed?.Invoke(Environment.TickCount64);
                         break;
                 }
             }
@@ -169,7 +181,7 @@ public sealed class GestureRecognitionService : IDisposable
         {
             Debug.WriteLine($"Gesture recognition failed: {ex}");
             ResetCapture();
-            PublishTouchSnapshot();
+            PublishTouchReset();
         }
 
         return PInvoke.CallWindowProcRaw(
@@ -270,7 +282,13 @@ public sealed class GestureRecognitionService : IDisposable
                 nint packet = rawData + packetIndex * (int)hid.dwSizeHid;
                 for (ushort nodeIndex = 1; nodeIndex <= childCount && _requiredRawContactCount > 0; nodeIndex++)
                 {
-                    _rawContacts.Add(ReadRawContact(preparsedData.Handle, packet, (int)hid.dwSizeHid, nodeIndex, physicalMax));
+                    _rawContacts.Add(ReadRawContact(
+                        (nint)raw.header.hDevice,
+                        preparsedData.Handle,
+                        packet,
+                        (int)hid.dwSizeHid,
+                        nodeIndex,
+                        physicalMax));
                     _requiredRawContactCount--;
                 }
             }
@@ -416,7 +434,13 @@ public sealed class GestureRecognitionService : IDisposable
         return 0;
     }
 
-    private static unsafe RawContact ReadRawContact(PHIDP_PREPARSED_DATA preparsedData, nint packet, int packetSize, ushort nodeIndex, PointerPoint physicalMax)
+    private static unsafe RawContact ReadRawContact(
+        nint deviceHandle,
+        PHIDP_PREPARSED_DATA preparsedData,
+        nint packet,
+        int packetSize,
+        ushort nodeIndex,
+        PointerPoint physicalMax)
     {
         uint contactId = 0;
         _ = PInvoke.HidP_GetUsageValue(
@@ -450,7 +474,7 @@ public sealed class GestureRecognitionService : IDisposable
             new PSTR((byte*)packet),
             (uint)packetSize);
 
-        var point = ScaleToScreen(physicalX, physicalY, physicalMax);
+        var point = ScaleToScreen(deviceHandle, physicalX, physicalY, physicalMax);
         bool isTip = IsTipContact(preparsedData, packet, packetSize, nodeIndex);
         return new((int)contactId, isTip, point);
     }
@@ -486,32 +510,89 @@ public sealed class GestureRecognitionService : IDisposable
             usages.Take((int)usageLength).Contains(TipId);
     }
 
-    private static PointerPoint ScaleToScreen(int physicalX, int physicalY, PointerPoint physicalMax)
+    private static unsafe PointerPoint ScaleToScreen(
+        nint deviceHandle,
+        int physicalX,
+        int physicalY,
+        PointerPoint physicalMax)
     {
+        RECT deviceRect;
+        RECT displayRect;
+        if (deviceHandle != 0 &&
+            PInvoke.GetPointerDeviceRects(
+                new HANDLE((void*)deviceHandle),
+                &deviceRect,
+                &displayRect))
+        {
+            return new(
+                ScaleCoordinate(
+                    physicalX,
+                    deviceRect.left,
+                    deviceRect.right,
+                    displayRect.left,
+                    displayRect.right),
+                ScaleCoordinate(
+                    physicalY,
+                    deviceRect.top,
+                    deviceRect.bottom,
+                    displayRect.top,
+                    displayRect.bottom));
+        }
+
         if (physicalMax.X <= 0 || physicalMax.Y <= 0)
             return new(physicalX, physicalY);
 
         int screenWidth = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXSCREEN));
         int screenHeight = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYSCREEN));
         return new(
-            physicalX * screenWidth / physicalMax.X,
-            physicalY * screenHeight / physicalMax.Y);
+            ScaleCoordinate(physicalX, 0, physicalMax.X, 0, screenWidth),
+            ScaleCoordinate(physicalY, 0, physicalMax.Y, 0, screenHeight));
+    }
+
+    internal static int ScaleCoordinate(
+        int value,
+        int sourceMinimum,
+        int sourceMaximum,
+        int targetMinimum,
+        int targetMaximumExclusive)
+    {
+        long sourceSpan = (long)sourceMaximum - sourceMinimum;
+        long targetSpan = (long)targetMaximumExclusive - targetMinimum;
+        if (sourceSpan <= 0 || targetSpan <= 1)
+            return targetMinimum;
+
+        long sourceOffset = Math.Clamp((long)value - sourceMinimum, 0, sourceSpan);
+        return targetMinimum +
+            (int)Math.Round(sourceOffset * (targetSpan - 1.0) / sourceSpan);
     }
 
     private void ProcessRawContacts(IReadOnlyList<RawContact> contacts)
     {
+        long timestamp = Environment.TickCount64;
         foreach (var contact in contacts)
         {
             if (contact.IsTip)
             {
-                if (_activeStrokes.ContainsKey(contact.Id))
+                bool wasActive = _activeStrokes.ContainsKey(contact.Id);
+                if (wasActive)
                     HandlePointerUpdate(contact.Id, contact.Point);
                 else
                     HandlePointerDown(contact.Id, contact.Point);
+
+                if (_activeStrokes.ContainsKey(contact.Id))
+                {
+                    PublishTouchContactChange(
+                        contact,
+                        wasActive ? TouchContactChangeKind.Move : TouchContactChangeKind.Down,
+                        timestamp);
+                }
             }
             else
             {
+                bool wasActive = _activeStrokes.ContainsKey(contact.Id);
                 HandlePointerUp(contact.Id, contact.Point);
+                if (wasActive)
+                    PublishTouchContactChange(contact, TouchContactChangeKind.Up, timestamp);
             }
         }
 
@@ -530,6 +611,32 @@ public sealed class GestureRecognitionService : IDisposable
             (int)_maxContactCount,
             Environment.TickCount64);
         TouchSnapshotChanged?.Invoke(CurrentTouchSnapshot);
+    }
+
+    private void PublishTouchContactChange(
+        RawContact contact,
+        TouchContactChangeKind kind,
+        long timestamp)
+    {
+        TouchContactChanged?.Invoke(new(
+            contact.Id,
+            kind,
+            new System.Drawing.Point(contact.Point.X, contact.Point.Y),
+            _activeStrokes.Count,
+            (int)_maxContactCount,
+            timestamp));
+    }
+
+    private void PublishTouchReset()
+    {
+        PublishTouchSnapshot();
+        TouchContactChanged?.Invoke(new(
+            0,
+            TouchContactChangeKind.Reset,
+            System.Drawing.Point.Empty,
+            0,
+            0,
+            Environment.TickCount64));
     }
 
     // Trigger early when one finger lifts with a swipe and the remaining fingers are stationary (held).

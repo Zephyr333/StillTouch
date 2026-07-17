@@ -84,6 +84,7 @@ internal static class AbsoluteMouseInput
                 dy = normalizedY,
                 dwFlags =
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_MOVE |
+                    MOUSE_EVENT_FLAGS.MOUSEEVENTF_MOVE_NOCOALESCE |
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_ABSOLUTE |
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_VIRTUALDESK,
                 dwExtraInfo = MouseInputSourceClassifier.InjectionMarker,

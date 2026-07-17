@@ -39,6 +39,8 @@ internal sealed class CapturedTouchStateMachine
     private readonly HashSet<uint> _activeContacts = [];
     private Candidate? _candidate;
 
+    public bool HasActiveContacts => _activeContacts.Count > 0;
+
     public bool IsDragging => _candidate?.IsDragging == true;
 
     public int? GetLongPressDelay(long nowMilliseconds)

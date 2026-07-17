@@ -13,11 +13,16 @@ namespace StillTouch.Core;
 public sealed class GlobalTouchMouseService : IDisposable
 {
     private const uint WM_TOUCH = 0x0240;
+    private const uint WM_POINTERUPDATE = 0x0245;
+    private const uint WM_POINTERDOWN = 0x0246;
+    private const uint WM_POINTERUP = 0x0247;
+    private const uint WM_POINTERCAPTURECHANGED = 0x024C;
     private const uint LongPressTimerMessage = 0x8000 + 0x53;
     private const uint TouchEventMove = 0x0001;
     private const uint TouchEventDown = 0x0002;
     private const uint TouchEventUp = 0x0004;
     private const uint TouchEventPen = 0x0040;
+    private const uint PointerFlagCanceled = 0x00008000;
 
     private readonly nint _captureWindowHandle;
     private readonly WndProcDelegate _wndProc;
@@ -26,6 +31,7 @@ public sealed class GlobalTouchMouseService : IDisposable
     private nint _previousWndProc;
     private bool _touchWindowRegistered;
     private bool _leftButtonInjected;
+    private InputPath _inputPath;
     private volatile bool _acceptingInput;
     private int _disposeStarted;
 
@@ -112,6 +118,19 @@ public sealed class GlobalTouchMouseService : IDisposable
                 return 0;
             }
 
+            if (message is WM_POINTERDOWN or WM_POINTERUPDATE or WM_POINTERUP)
+            {
+                if (ProcessPointerMessage(message, wParam))
+                    return 0;
+            }
+
+            if (message == WM_POINTERCAPTURECHANGED && _touchState.HasActiveContacts)
+            {
+                ExecuteDecision(_touchState.Reset());
+                CancelLongPressTimer();
+                return 0;
+            }
+
             if (message == LongPressTimerMessage)
             {
                 if (_acceptingInput)
@@ -145,6 +164,15 @@ public sealed class GlobalTouchMouseService : IDisposable
         {
             if (!_acceptingInput)
                 return;
+
+            if (_inputPath == InputPath.Pointer)
+                return;
+
+            if (_inputPath == InputPath.Unknown)
+            {
+                _inputPath = InputPath.Touch;
+                ReportDiagnostic("触摸输入路径已激活：WM_TOUCH。");
+            }
 
             int inputCount = unchecked((ushort)(wParam & 0xFFFF));
             if (inputCount <= 0)
@@ -192,6 +220,51 @@ public sealed class GlobalTouchMouseService : IDisposable
         }
     }
 
+    private bool ProcessPointerMessage(uint message, nuint wParam)
+    {
+        if (!_acceptingInput)
+            return false;
+
+        uint pointerId = (uint)(wParam & 0xFFFF);
+        if (!PInvoke.GetPointerInfo(pointerId, out var pointerInfo) ||
+            pointerInfo.pointerType != POINTER_INPUT_TYPE.PT_TOUCH)
+        {
+            return false;
+        }
+
+        if (_inputPath == InputPath.Touch)
+            return true;
+
+        if (_inputPath == InputPath.Unknown)
+        {
+            _inputPath = InputPath.Pointer;
+            ReportDiagnostic("触摸输入路径已激活：WM_POINTER。");
+        }
+
+        if (((uint)pointerInfo.pointerFlags & PointerFlagCanceled) != 0)
+        {
+            ExecuteDecision(_touchState.Reset());
+            CancelLongPressTimer();
+            return true;
+        }
+
+        CapturedTouchChangeKind kind = message switch
+        {
+            WM_POINTERDOWN => CapturedTouchChangeKind.Down,
+            WM_POINTERUP => CapturedTouchChangeKind.Up,
+            _ => CapturedTouchChangeKind.Move,
+        };
+        var point = new Point(
+            pointerInfo.ptPixelLocation.X,
+            pointerInfo.ptPixelLocation.Y);
+        long now = Environment.TickCount64;
+        ExecuteDecision(_touchState.Process(
+            new CapturedTouchChange(pointerId, kind, point, now),
+            GetMovementThreshold(point)));
+        ScheduleLongPressTimer(now);
+        return true;
+    }
+
     private void ExecuteDecision(CapturedTouchDecision decision)
     {
         if (decision.Action == CapturedTouchAction.None || !_acceptingInput)
@@ -231,7 +304,15 @@ public sealed class GlobalTouchMouseService : IDisposable
         }
 
         if (succeeded)
+        {
+            if (decision.Action != CapturedTouchAction.MoveLeftDrag)
+            {
+                ReportDiagnostic(
+                    $"已转换 {decision.Action}：({decision.Position.X}, {decision.Position.Y})。");
+            }
+
             return;
+        }
 
         int error = Marshal.GetLastPInvokeError();
         // A failed batch may have stopped after a button-down event. Explicitly lift both buttons;
@@ -352,4 +433,11 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate nint WndProcDelegate(nint hWnd, uint message, nuint wParam, nint lParam);
+
+    private enum InputPath
+    {
+        Unknown,
+        Pointer,
+        Touch,
+    }
 }

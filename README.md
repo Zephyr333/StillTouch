@@ -1,6 +1,6 @@
 # StillTouch
 
-StillTouch 是一个 Windows 全局触摸转鼠标工具。启用后用覆盖整个虚拟桌面的透明触摸捕获层接管手指输入：轻点对应鼠标左键，长按对应鼠标右键，单指移动对应普通鼠标拖动。手写笔和真实鼠标不经过转换。
+StillTouch 是一个 Windows 全局触摸转鼠标工具。启用后用覆盖整个虚拟桌面的透明触摸捕获层接管手指输入，通过 Windows 10/11 的 `WM_POINTER` 或兼容 `WM_TOUCH` 路径识别接触：轻点对应鼠标左键，长按对应鼠标右键，单指移动对应普通鼠标拖动。手写笔和真实鼠标不经过转换。
 
 > StillTouch 致敬并基于 [luojunyuan/TouchChanX](https://github.com/luojunyuan/TouchChanX) 的 Win32 输入处理基础发展而来。感谢原作者公开项目与实现思路。详细说明见 [NOTICE.md](NOTICE.md)。
 

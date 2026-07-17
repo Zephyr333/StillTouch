@@ -53,4 +53,5 @@ SendInput
 MapVirtualKey
 SetCursorPos
 CallWindowProc
+GetPointerInfo
 GetSystemMetrics

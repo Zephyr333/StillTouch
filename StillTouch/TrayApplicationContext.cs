@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using System.Diagnostics;
 using StillTouch.Core;
 
 namespace StillTouch;
@@ -11,6 +12,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
     private System.Windows.Forms.Timer? _deferredActionTimer;
+    private System.Threading.Timer? _exitWorker;
     private System.Threading.Timer? _exitWatchdog;
     private GlobalTouchMouseService? _service;
     private PendingAction _pendingAction;
@@ -120,38 +122,56 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _exitRequested = true;
         CancelDeferredAction();
 
-        // Only perform the lock-free fail-open write while inside the ToolStrip callback. Timer
-        // cancellation, SendInput button release and hook teardown are deferred until it returns.
-        RuntimeLog.WriteAsync("收到退出请求；输入处理已立即停止拦截，等待安全拆除。");
+        // A ToolStripDropDown owns a nested message loop. A WinForms timer can therefore tick
+        // before the menu callback and its mouse capture have actually unwound. Do only the
+        // lock-free fail-open write here; release buttons and terminate from ThreadPool timers.
+        RuntimeLog.WriteAsync("收到退出请求；输入处理已立即停止拦截，等待安全退出。");
         _service?.StopAcceptingInput();
 
-        // If a native cleanup call ever blocks, terminate the process so Windows removes the
-        // global hook. Input has already been put in fail-open mode and all buttons released.
-        _exitWatchdog = new System.Threading.Timer(
-            _ => Environment.Exit(0),
+        _exitWorker = new System.Threading.Timer(
+            _ => CompleteExitOffUiThread(),
             null,
-            TimeSpan.FromSeconds(5),
+            TimeSpan.FromMilliseconds(200),
             Timeout.InfiniteTimeSpan);
 
-        ScheduleDeferredAction(PendingAction.Exit, delayMilliseconds: 75);
+        // If SendInput or the CLR exit path ever blocks, force process termination. Windows then
+        // removes the low-level hook and releases any window/menu capture owned by this process.
+        _exitWatchdog = new System.Threading.Timer(
+            _ => ForceTerminateProcess(),
+            null,
+            TimeSpan.FromSeconds(3),
+            Timeout.InfiniteTimeSpan);
     }
 
-    private void ExecuteExit()
+    private void CompleteExitOffUiThread()
     {
-        RuntimeLog.Write("已离开托盘回调，开始拆除全局输入 Hook。");
-        _trayIcon.ContextMenuStrip?.Close();
-        _trayIcon.Visible = false;
+        try
+        {
+            // Do not uninstall the hook or destroy its message window here. Stopping interception
+            // plus an explicit button release is enough; process termination removes the hook
+            // atomically without re-entering WinForms' tray-menu cleanup.
+            _service?.EnterFailOpenMode();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            RuntimeLog.WriteAsync($"退出前释放鼠标按键失败：{ex}");
+        }
+        finally
+        {
+            Environment.Exit(0);
+        }
+    }
 
-        var service = _service;
-        _service = null;
-        if (service is not null)
-            service.DiagnosticMessage -= OnServiceDiagnostic;
-        service?.Dispose();
-        RuntimeLog.Write("全局输入 Hook 已拆除，鼠标按键已释放。");
-
-        _exitWatchdog?.Dispose();
-        _exitWatchdog = null;
-        ExitThread();
+    private static void ForceTerminateProcess()
+    {
+        try
+        {
+            Process.GetCurrentProcess().Kill(entireProcessTree: false);
+        }
+        catch
+        {
+            Environment.FailFast("StillTouch exit watchdog timed out.");
+        }
     }
 
     private void ScheduleDeferredAction(PendingAction action, int delayMilliseconds)
@@ -176,9 +196,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
             case PendingAction.Toggle when !_exitRequested:
                 ExecuteToggle();
                 break;
-            case PendingAction.Exit:
-                ExecuteExit();
-                break;
         }
     }
 
@@ -200,6 +217,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             CancelDeferredAction();
+
+            _exitWorker?.Dispose();
+            _exitWorker = null;
 
             _exitWatchdog?.Dispose();
             _exitWatchdog = null;
@@ -253,6 +273,5 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         None,
         Toggle,
-        Exit,
     }
 }

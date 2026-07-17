@@ -8,6 +8,8 @@ namespace StillTouch.Core;
 
 internal static class AbsoluteMouseInput
 {
+    private const nuint InjectionMarker = 0x5443584D;
+
     public static bool Click(Point point, bool rightButton)
     {
         var (x, y) = Normalize(point);
@@ -34,6 +36,12 @@ internal static class AbsoluteMouseInput
             CreateAbsoluteMove(currentX, currentY));
     }
 
+    public static bool Move(Point point)
+    {
+        var (x, y) = Normalize(point);
+        return Send(CreateAbsoluteMove(x, y));
+    }
+
     public static bool CompleteLeftDrag(Point start, Point end)
     {
         var (startX, startY) = Normalize(start);
@@ -52,6 +60,9 @@ internal static class AbsoluteMouseInput
             CreateAbsoluteMove(x, y),
             CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_LEFTUP));
     }
+
+    public static bool ReleaseLeftAtCurrentPosition() =>
+        Send(CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_LEFTUP));
 
     public static bool ReleaseButtons() => Send(
         CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_LEFTUP),
@@ -91,7 +102,7 @@ internal static class AbsoluteMouseInput
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_MOVE_NOCOALESCE |
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_ABSOLUTE |
                     MOUSE_EVENT_FLAGS.MOUSEEVENTF_VIRTUALDESK,
-                dwExtraInfo = MouseInputSourceClassifier.InjectionMarker,
+                dwExtraInfo = InjectionMarker,
             },
         },
     };
@@ -104,7 +115,7 @@ internal static class AbsoluteMouseInput
             mi = new MOUSEINPUT
             {
                 dwFlags = flags,
-                dwExtraInfo = MouseInputSourceClassifier.InjectionMarker,
+                dwExtraInfo = InjectionMarker,
             },
         },
     };

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using StillTouch.Core.Interop;
 using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.UI.WindowsAndMessaging;
@@ -11,69 +12,75 @@ namespace StillTouch.Core;
 [SupportedOSPlatform("windows10.0.14393")]
 public sealed class GlobalTouchMouseService : IDisposable
 {
-    private const uint WM_MOUSEMOVE = 0x0200;
-    private const uint WM_LBUTTONDOWN = 0x0201;
-    private const uint WM_LBUTTONUP = 0x0202;
-    private const uint WM_RBUTTONDOWN = 0x0204;
-    private const uint WM_RBUTTONUP = 0x0205;
-    private const int RawSuppressionWindowMilliseconds = 2000;
+    private const uint WM_TOUCH = 0x0240;
+    private const uint LongPressTimerMessage = 0x8000 + 0x53;
+    private const uint TouchEventMove = 0x0001;
+    private const uint TouchEventDown = 0x0002;
+    private const uint TouchEventUp = 0x0004;
+    private const uint TouchEventPen = 0x0040;
 
-    private readonly nint _messageWindowHandle;
-    private readonly HOOKPROC _hookProc;
-    private readonly GestureRecognitionService _touchMonitor;
-    private readonly TouchMouseStateMachine _mouseState = new();
-    private readonly RawTouchClickStateMachine _rawTouchState = new();
+    private readonly nint _captureWindowHandle;
+    private readonly WndProcDelegate _wndProc;
+    private readonly CapturedTouchStateMachine _touchState = new();
     private readonly System.Threading.Timer _longPressTimer;
-    private UnhookWindowsHookExSafeHandle? _hook;
-    private long _suppressedRawSequence = -1;
-    private long _suppressionExpiresAtMilliseconds;
+    private nint _previousWndProc;
+    private bool _touchWindowRegistered;
+    private bool _leftButtonInjected;
     private volatile bool _acceptingInput;
     private int _disposeStarted;
 
     public event Action<string>? DiagnosticMessage;
 
-    public GlobalTouchMouseService(nint messageWindowHandle)
+    public GlobalTouchMouseService(nint captureWindowHandle)
     {
-        if (messageWindowHandle == nint.Zero)
-            throw new ArgumentException("A message window handle is required.", nameof(messageWindowHandle));
+        if (captureWindowHandle == nint.Zero)
+            throw new ArgumentException("A touch capture window handle is required.", nameof(captureWindowHandle));
 
-        _messageWindowHandle = messageWindowHandle;
-        _touchMonitor = new GestureRecognitionService(messageWindowHandle);
-        _touchMonitor.TouchContactChanged += OnTouchContactChanged;
-        _touchMonitor.LongPressTimerElapsed += OnLongPressTimerElapsed;
-        _touchMonitor.DiagnosticMessage += ReportDiagnostic;
+        _captureWindowHandle = captureWindowHandle;
+        _wndProc = WndProc;
         _longPressTimer = new System.Threading.Timer(
             PostLongPressTimerMessage,
             null,
             Timeout.Infinite,
             Timeout.Infinite);
-        _hookProc = Hook;
+
+        _previousWndProc = PInvoke.SetWindowLongPtr(
+            new HWND(_captureWindowHandle),
+            WINDOW_LONG_PTR_INDEX.GWL_WNDPROC,
+            Marshal.GetFunctionPointerForDelegate(_wndProc));
+        if (_previousWndProc == 0)
+        {
+            _longPressTimer.Dispose();
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), "无法接管触摸捕获窗口。");
+        }
 
         try
         {
-            var moduleHandle = PInvoke.GetModuleHandle(null);
-            _hook = PInvoke.SetWindowsHookEx(
-                WINDOWS_HOOK_ID.WH_MOUSE_LL,
-                _hookProc,
-                moduleHandle,
-                0);
-            if (_hook.IsInvalid)
-                throw new Win32Exception();
+            if (TouchNativeMethods.RegisterTouchWindow(_captureWindowHandle, 0) == 0)
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), "无法注册全屏触摸捕获窗口。");
 
+            _touchWindowRegistered = true;
             _acceptingInput = true;
-            _touchMonitor.IsEnabled = true;
         }
         catch
         {
-            _hook?.Dispose();
-            _hook = null;
+            _ = PInvoke.SetWindowLongPtr(
+                new HWND(_captureWindowHandle),
+                WINDOW_LONG_PTR_INDEX.GWL_WNDPROC,
+                _previousWndProc);
+            _previousWndProc = 0;
             _longPressTimer.Dispose();
-            _touchMonitor.TouchContactChanged -= OnTouchContactChanged;
-            _touchMonitor.LongPressTimerElapsed -= OnLongPressTimerElapsed;
-            _touchMonitor.DiagnosticMessage -= ReportDiagnostic;
-            _touchMonitor.Dispose();
             throw;
         }
+    }
+
+    public void EnterFailOpenMode()
+    {
+        _acceptingInput = false;
+        CancelLongPressTimer();
+        UnregisterTouchWindow();
+        ReleaseSyntheticDrag();
+        _touchState.Reset();
     }
 
     public void Dispose()
@@ -82,136 +89,190 @@ public sealed class GlobalTouchMouseService : IDisposable
             return;
 
         EnterFailOpenMode();
-        _touchMonitor.TouchContactChanged -= OnTouchContactChanged;
-        _touchMonitor.LongPressTimerElapsed -= OnLongPressTimerElapsed;
-        _touchMonitor.DiagnosticMessage -= ReportDiagnostic;
 
-        // Stop the hook before the final button release. Hook callbacks always forward with a null
-        // handle, so disposing the SafeHandle cannot race CallNextHookEx during shutdown.
-        _hook?.Dispose();
-        _hook = null;
-        _ = AbsoluteMouseInput.ReleaseButtons();
-        _mouseState.Reset();
-        _rawTouchState.Reset();
-        _suppressedRawSequence = -1;
-        _suppressionExpiresAtMilliseconds = 0;
+        if (_previousWndProc != 0)
+        {
+            _ = PInvoke.SetWindowLongPtr(
+                new HWND(_captureWindowHandle),
+                WINDOW_LONG_PTR_INDEX.GWL_WNDPROC,
+                _previousWndProc);
+            _previousWndProc = 0;
+        }
 
         _longPressTimer.Dispose();
-        _touchMonitor.Dispose();
     }
 
-    public void EnterFailOpenMode()
+    private nint WndProc(nint hwnd, uint message, nuint wParam, nint lParam)
     {
-        _acceptingInput = false;
-        CancelLongPressTimer();
-
-        // A partially replayed drag must never survive disabling or process shutdown. Releasing
-        // both buttons is idempotent and also recovers from a partial SendInput sequence.
-        _ = AbsoluteMouseInput.ReleaseButtons();
-    }
-
-    private LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
-    {
-        if (nCode < 0 || lParam.Value == 0 || !_acceptingInput)
-            return CallNext(nCode, wParam, lParam);
-
         try
         {
-            var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-            nuint extraInfo = unchecked((nuint)info.dwExtraInfo);
-
-            if (MouseInputSourceClassifier.IsOwnInjection(extraInfo) ||
-                !MouseInputSourceClassifier.IsTouchDerived(extraInfo) ||
-                !TryMapMessage((uint)wParam.Value, out var message))
+            if (message == WM_TOUCH)
             {
-                return CallNext(nCode, wParam, lParam);
+                ProcessTouchMessage(wParam, lParam);
+                return 0;
             }
 
-            long now = Environment.TickCount64;
-            if (_suppressedRawSequence == _rawTouchState.CurrentSequence &&
-                now <= _suppressionExpiresAtMilliseconds &&
-                IsButtonMessage(message))
+            if (message == LongPressTimerMessage)
             {
-                return new LRESULT(1);
-            }
+                if (_acceptingInput)
+                {
+                    long now = Environment.TickCount64;
+                    ExecuteDecision(_touchState.TryTriggerLongPress(now));
+                    ScheduleLongPressTimer(now);
+                }
 
-            var point = new Point(info.pt.X, info.pt.Y);
-            var decision = _mouseState.Process(
-                message,
-                point,
-                _touchMonitor.CurrentTouchSnapshot,
-                now,
-                GetMovementThreshold(point));
-
-            if (decision.Action is TouchMouseAction.LeftClick or TouchMouseAction.RightClick)
-            {
-                var rawAction = decision.Action == TouchMouseAction.RightClick
-                    ? RawTouchClickAction.RightClick
-                    : RawTouchClickAction.LeftClick;
-                if (_rawTouchState.TryAdoptNativeClick(rawAction, decision.EndPoint, now, out var rawDecision))
-                    ExecuteRawDecision(rawDecision);
-                else
-                    ExecuteMouseDecision(decision);
+                return 0;
             }
-            else
-            {
-                ExecuteMouseDecision(decision);
-            }
-
-            return decision.Suppress ? new LRESULT(1) : CallNext(nCode, wParam, lParam);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            Debug.WriteLine($"Global touch-to-mouse hook failed: {ex}");
-            ReleaseReplayedDragIfNeeded();
-            _mouseState.Reset();
-            _rawTouchState.Reset();
-            ClearRawSuppression();
-            CancelLongPressTimer();
-            ReportDiagnostic($"低级鼠标 Hook 处理失败：{ex}");
-            return CallNext(nCode, wParam, lParam);
+            RecoverFromInputFailure($"透明触摸捕获处理失败：{ex}");
+            if (message == WM_TOUCH)
+                return 0;
+        }
+
+        return PInvoke.CallWindowProcRaw(
+            _previousWndProc,
+            hwnd,
+            message,
+            wParam,
+            lParam);
+    }
+
+    private unsafe void ProcessTouchMessage(nuint wParam, nint touchInputHandle)
+    {
+        try
+        {
+            if (!_acceptingInput)
+                return;
+
+            int inputCount = unchecked((ushort)(wParam & 0xFFFF));
+            if (inputCount <= 0)
+                return;
+
+            var inputs = new NativeTouchInput[inputCount];
+            fixed (NativeTouchInput* inputPointer = inputs)
+            {
+                if (TouchNativeMethods.GetTouchInputInfo(
+                        touchInputHandle,
+                        (uint)inputCount,
+                        inputPointer,
+                        Marshal.SizeOf<NativeTouchInput>()) == 0)
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastPInvokeError(),
+                        "GetTouchInputInfo 失败。");
+                }
+            }
+
+            long now = Environment.TickCount64;
+            foreach (NativeTouchInput input in inputs)
+            {
+                // Pen normally follows the pointer/pen path. If a digitizer marks it here,
+                // never turn it into a mouse action.
+                if ((input.Flags & TouchEventPen) != 0)
+                    continue;
+
+                if (!TryGetChangeKind(input.Flags, out var kind))
+                    continue;
+
+                var point = new Point(
+                    DivideHundredths(input.X),
+                    DivideHundredths(input.Y));
+                ExecuteDecision(_touchState.Process(
+                    new CapturedTouchChange(input.Id, kind, point, now),
+                    GetMovementThreshold(point)));
+            }
+
+            ScheduleLongPressTimer(now);
+        }
+        finally
+        {
+            _ = TouchNativeMethods.CloseTouchInputHandle(touchInputHandle);
         }
     }
 
-    private void OnTouchContactChanged(TouchContactChange change)
+    private void ExecuteDecision(CapturedTouchDecision decision)
     {
-        if (!_acceptingInput)
+        if (decision.Action == CapturedTouchAction.None || !_acceptingInput)
             return;
 
-        if (change.Kind == TouchContactChangeKind.Reset)
-            ClearRawSuppression();
+        bool succeeded;
+        switch (decision.Action)
+        {
+            case CapturedTouchAction.LeftClick:
+                succeeded = AbsoluteMouseInput.Click(decision.Position, rightButton: false);
+                break;
+            case CapturedTouchAction.RightClick:
+                succeeded = AbsoluteMouseInput.Click(decision.Position, rightButton: true);
+                break;
+            case CapturedTouchAction.BeginLeftDrag:
+                // SendInput can partially accept a batch. Assume LEFTDOWN may have reached the
+                // system until the whole batch reports success, so the failure path always lifts it.
+                _leftButtonInjected = true;
+                succeeded = AbsoluteMouseInput.BeginLeftDrag(decision.StartPoint, decision.Position);
+                break;
+            case CapturedTouchAction.MoveLeftDrag:
+                succeeded = AbsoluteMouseInput.Move(decision.Position);
+                break;
+            case CapturedTouchAction.EndLeftDrag:
+                succeeded = AbsoluteMouseInput.ReleaseLeft(decision.Position);
+                if (succeeded)
+                    _leftButtonInjected = false;
+                break;
+            case CapturedTouchAction.CompleteLeftDrag:
+                _leftButtonInjected = true;
+                succeeded = AbsoluteMouseInput.CompleteLeftDrag(decision.StartPoint, decision.Position);
+                if (succeeded)
+                    _leftButtonInjected = false;
+                break;
+            default:
+                return;
+        }
 
-        int threshold = change.Kind == TouchContactChangeKind.Reset
-            ? 12
-            : GetMovementThreshold(change.Position);
-        var decision = _rawTouchState.Process(change, threshold);
-        ScheduleLongPressTimer(change.TimestampMilliseconds);
-        ExecuteRawDecision(decision);
+        if (succeeded)
+            return;
 
-        if (change.ActiveContactCount == 0)
-            ReleaseReplayedDragIfNeeded();
+        int error = Marshal.GetLastPInvokeError();
+        // A failed batch may have stopped after a button-down event. Explicitly lift both buttons;
+        // this path is only used after a failed injection, never during ordinary shutdown.
+        _ = AbsoluteMouseInput.ReleaseButtons();
+        _leftButtonInjected = false;
+        _touchState.Reset();
+        CancelLongPressTimer();
+        ReportDiagnostic($"SendInput 执行 {decision.Action} 失败，Win32 错误 {error}。");
     }
 
-    private void OnLongPressTimerElapsed(long nowMilliseconds)
+    private void RecoverFromInputFailure(string message)
     {
-        if (!_acceptingInput)
+        ReleaseSyntheticDrag();
+        _touchState.Reset();
+        CancelLongPressTimer();
+        ReportDiagnostic(message);
+    }
+
+    private void ReleaseSyntheticDrag()
+    {
+        if (!_leftButtonInjected)
             return;
 
-        var decision = _rawTouchState.TryTriggerLongPress(nowMilliseconds);
-        ScheduleLongPressTimer(nowMilliseconds);
-        ExecuteRawDecision(decision);
+        _leftButtonInjected = false;
+        if (!AbsoluteMouseInput.ReleaseLeftAtCurrentPosition())
+        {
+            ReportDiagnostic(
+                $"紧急释放拖动左键失败，Win32 错误 {Marshal.GetLastPInvokeError()}。");
+        }
     }
 
     private void ScheduleLongPressTimer(long nowMilliseconds)
     {
-        int? delay = _rawTouchState.GetLongPressDelay(nowMilliseconds);
+        int? delay = _touchState.GetLongPressDelay(nowMilliseconds);
         try
         {
             _ = _longPressTimer.Change(delay ?? Timeout.Infinite, Timeout.Infinite);
         }
         catch (ObjectDisposedException)
         {
-            // Shutdown won the race; no timer message is needed.
         }
     }
 
@@ -232,80 +293,23 @@ public sealed class GlobalTouchMouseService : IDisposable
             return;
 
         _ = PInvoke.PostMessage(
-            new HWND(_messageWindowHandle),
-            GestureRecognitionService.LongPressTimerMessage,
+            new HWND(_captureWindowHandle),
+            LongPressTimerMessage,
             default,
             default);
     }
 
-    private void ExecuteRawDecision(RawTouchClickDecision decision)
+    private void UnregisterTouchWindow()
     {
-        if (decision.Action == RawTouchClickAction.None || !_acceptingInput)
+        if (!_touchWindowRegistered)
             return;
 
-        bool succeeded = AbsoluteMouseInput.Click(
-            decision.Position,
-            rightButton: decision.Action == RawTouchClickAction.RightClick);
-        if (succeeded)
+        _touchWindowRegistered = false;
+        if (TouchNativeMethods.UnregisterTouchWindow(_captureWindowHandle) == 0)
         {
-            _suppressedRawSequence = decision.Sequence;
-            _suppressionExpiresAtMilliseconds =
-                Environment.TickCount64 + RawSuppressionWindowMilliseconds;
-            _mouseState.Reset();
-        }
-        else
-        {
-            int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
-            _rawTouchState.MarkInjectionFailed(decision.Sequence);
-            Debug.WriteLine(
-                $"SendInput failed for raw {decision.Action}; Win32 error {error}.");
             ReportDiagnostic(
-                $"原始触摸转换 {decision.Action} 的 SendInput 失败，Win32 错误 {error}。");
+                $"注销透明触摸捕获窗口失败，Win32 错误 {Marshal.GetLastPInvokeError()}。");
         }
-    }
-
-    private void ReleaseReplayedDragIfNeeded()
-    {
-        if (_mouseState.TryEndReplayedDrag(out var point) &&
-            !AbsoluteMouseInput.ReleaseLeft(point))
-        {
-            int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
-            Debug.WriteLine($"Failed to release replayed left drag; Win32 error {error}.");
-            ReportDiagnostic($"释放拖动左键失败，Win32 错误 {error}。");
-        }
-    }
-
-    private LRESULT CallNext(int nCode, WPARAM wParam, LPARAM lParam) =>
-        PInvoke.CallNextHookEx(null, nCode, wParam, lParam);
-
-    private void ExecuteMouseDecision(TouchMouseDecision decision)
-    {
-        bool succeeded = decision.Action switch
-        {
-            TouchMouseAction.None => true,
-            TouchMouseAction.LeftClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: false),
-            TouchMouseAction.RightClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: true),
-            TouchMouseAction.BeginLeftDrag => AbsoluteMouseInput.BeginLeftDrag(decision.StartPoint, decision.EndPoint),
-            TouchMouseAction.CompleteLeftDrag => AbsoluteMouseInput.CompleteLeftDrag(decision.StartPoint, decision.EndPoint),
-            _ => true,
-        };
-
-        if (!succeeded)
-        {
-            int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
-            Debug.WriteLine($"SendInput failed for {decision.Action}; Win32 error {error}.");
-            ReportDiagnostic(
-                $"兼容触摸转换 {decision.Action} 的 SendInput 失败，Win32 错误 {error}。");
-        }
-    }
-
-    private void ClearRawSuppression()
-    {
-        _suppressedRawSequence = -1;
-        _suppressionExpiresAtMilliseconds = 0;
     }
 
     private void ReportDiagnostic(string message)
@@ -316,9 +320,12 @@ public sealed class GlobalTouchMouseService : IDisposable
         }
         catch
         {
-            // Logging must never interfere with the global input path.
+            // Logging must never interfere with the input path.
         }
     }
+
+    private static int DivideHundredths(int value) =>
+        value >= 0 ? (value + 50) / 100 : (value - 50) / 100;
 
     private static int GetMovementThreshold(Point point)
     {
@@ -327,33 +334,22 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (dpi == 0)
             dpi = 96;
 
-        return Math.Max(8, (int)Math.Ceiling(12.0 * dpi / 96.0));
+        return Math.Max(10, (int)Math.Ceiling(14.0 * dpi / 96.0));
     }
 
-    private static bool IsButtonMessage(TouchMouseMessage message) =>
-        message is
-            TouchMouseMessage.LeftDown or
-            TouchMouseMessage.LeftUp or
-            TouchMouseMessage.RightDown or
-            TouchMouseMessage.RightUp;
-
-    private static bool TryMapMessage(uint message, out TouchMouseMessage mapped)
+    private static bool TryGetChangeKind(uint flags, out CapturedTouchChangeKind kind)
     {
-        mapped = message switch
-        {
-            WM_MOUSEMOVE => TouchMouseMessage.Move,
-            WM_LBUTTONDOWN => TouchMouseMessage.LeftDown,
-            WM_LBUTTONUP => TouchMouseMessage.LeftUp,
-            WM_RBUTTONDOWN => TouchMouseMessage.RightDown,
-            WM_RBUTTONUP => TouchMouseMessage.RightUp,
-            _ => default,
-        };
+        kind = (flags & TouchEventDown) != 0
+            ? CapturedTouchChangeKind.Down
+            : (flags & TouchEventUp) != 0
+                ? CapturedTouchChangeKind.Up
+                : (flags & TouchEventMove) != 0
+                    ? CapturedTouchChangeKind.Move
+                    : default;
 
-        return message is
-            WM_MOUSEMOVE or
-            WM_LBUTTONDOWN or
-            WM_LBUTTONUP or
-            WM_RBUTTONDOWN or
-            WM_RBUTTONUP;
+        return (flags & (TouchEventDown | TouchEventMove | TouchEventUp)) != 0;
     }
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate nint WndProcDelegate(nint hWnd, uint message, nuint wParam, nint lParam);
 }

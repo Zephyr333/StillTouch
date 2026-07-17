@@ -6,18 +6,22 @@ namespace StillTouch;
 [SupportedOSPlatform("windows10.0.19041")]
 internal sealed class TrayApplicationContext : ApplicationContext
 {
-    private readonly MessageWindow _messageWindow;
+    private readonly TouchCaptureWindow _captureWindow;
     private readonly Icon _enabledIcon;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly System.Windows.Forms.Timer _topMostTimer;
+    private System.Windows.Forms.Timer? _toggleTimer;
     private System.Windows.Forms.Timer? _exitTimer;
     private System.Threading.Timer? _exitWatchdog;
     private GlobalTouchMouseService? _service;
     private bool _exitRequested;
+    private bool _togglePending;
+    private long _lastToggleRequestAt;
 
     public TrayApplicationContext()
     {
-        _messageWindow = new MessageWindow();
+        _captureWindow = new TouchCaptureWindow();
         _enabledIcon = LoadAppIcon();
 
         var exitItem = new ToolStripMenuItem("退出");
@@ -37,6 +41,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.ContextMenuStrip.Items.Add(exitItem);
         _trayIcon.MouseClick += OnTrayIconMouseClick;
 
+        _topMostTimer = new System.Windows.Forms.Timer { Interval = 750 };
+        _topMostTimer.Tick += (_, _) => _captureWindow.EnsureTopMost();
+        _topMostTimer.Start();
+
         EnableService(showNotification: false);
     }
 
@@ -45,17 +53,56 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (args.Button != MouseButtons.Left)
             return;
 
-        if (_service is null)
-            EnableService(showNotification: true);
-        else
-            DisableService(showNotification: true);
+        ScheduleToggle();
+    }
+
+    private void ScheduleToggle()
+    {
+        if (_exitRequested || _togglePending)
+            return;
+
+        long now = Environment.TickCount64;
+        if (now - _lastToggleRequestAt <= SystemInformation.DoubleClickTime)
+            return;
+
+        _lastToggleRequestAt = now;
+        _togglePending = true;
+        _toggleTimer = new System.Windows.Forms.Timer { Interval = 30 };
+        _toggleTimer.Tick += (_, _) =>
+        {
+            _toggleTimer.Stop();
+            _toggleTimer.Dispose();
+            _toggleTimer = null;
+            _togglePending = false;
+
+            if (_exitRequested)
+                return;
+
+            if (_service is null)
+                EnableService(showNotification: true);
+            else
+                DisableService(showNotification: true);
+        };
+        _toggleTimer.Start();
     }
 
     private void EnableService(bool showNotification)
     {
-        var service = new GlobalTouchMouseService(_messageWindow.Handle);
-        service.DiagnosticMessage += OnServiceDiagnostic;
-        _service = service;
+        var service = new GlobalTouchMouseService(_captureWindow.Handle);
+        try
+        {
+            service.DiagnosticMessage += OnServiceDiagnostic;
+            _captureWindow.ShowCapture();
+            _service = service;
+        }
+        catch
+        {
+            service.DiagnosticMessage -= OnServiceDiagnostic;
+            service.Dispose();
+            _captureWindow.HideCapture();
+            throw;
+        }
+
         RuntimeLog.WriteAsync("触摸转鼠标功能已开启。");
         UpdateTrayState(isEnabled: true);
         if (showNotification)
@@ -64,10 +111,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void DisableService(bool showNotification)
     {
-        if (_service is not null)
-            _service.DiagnosticMessage -= OnServiceDiagnostic;
-        _service?.Dispose();
+        var service = _service;
         _service = null;
+        _captureWindow.HideCapture();
+        if (service is not null)
+            service.DiagnosticMessage -= OnServiceDiagnostic;
+        service?.Dispose();
         RuntimeLog.WriteAsync("触摸转鼠标功能已关闭。");
         UpdateTrayState(isEnabled: false);
         if (showNotification)
@@ -100,18 +149,19 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _exitRequested = true;
         RuntimeLog.Write("收到退出请求；输入处理已立即切换为放行模式。");
         _service?.EnterFailOpenMode();
+        _captureWindow.HideCapture();
         _trayIcon.Visible = false;
         _trayIcon.ContextMenuStrip?.Close();
 
-        // If a native cleanup call ever blocks, terminate the process so Windows removes the
-        // global hook. Input has already been put in fail-open mode and all buttons released.
+        // If native cleanup ever blocks, terminate the process after the capture window has
+        // already been hidden and unregistered so it cannot hold the user's input hostage.
         _exitWatchdog = new System.Threading.Timer(
             _ => Environment.Exit(0),
             null,
             TimeSpan.FromSeconds(5),
             Timeout.InfiniteTimeSpan);
 
-        // Leave the ToolStrip click callback before tearing down hooks and native tray resources.
+        // Leave the ToolStrip click callback before tearing down touch and tray resources.
         _exitTimer = new System.Windows.Forms.Timer { Interval = 1 };
         _exitTimer.Tick += (_, _) =>
         {
@@ -119,13 +169,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _exitTimer.Dispose();
             _exitTimer = null;
 
-            RuntimeLog.Write("开始拆除全局输入 Hook。");
+            RuntimeLog.Write("开始拆除透明触摸捕获层。");
 
             if (_service is not null)
                 _service.DiagnosticMessage -= OnServiceDiagnostic;
             _service?.Dispose();
             _service = null;
-            RuntimeLog.Write("全局输入 Hook 已拆除，鼠标按键已释放。");
+            RuntimeLog.Write("透明触摸捕获层已拆除，合成拖动按键已释放。");
 
             _exitWatchdog.Dispose();
             _exitWatchdog = null;
@@ -138,6 +188,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         if (disposing)
         {
+            _toggleTimer?.Stop();
+            _toggleTimer?.Dispose();
+            _toggleTimer = null;
+
+            _topMostTimer.Stop();
+            _topMostTimer.Dispose();
+
             _exitTimer?.Stop();
             _exitTimer?.Dispose();
             _exitTimer = null;
@@ -157,7 +214,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _trayIcon.Dispose();
             contextMenu?.Dispose();
             _enabledIcon.Dispose();
-            _messageWindow.Dispose();
+            _captureWindow.Dispose();
         }
 
         base.Dispose(disposing);
@@ -172,19 +229,4 @@ internal sealed class TrayApplicationContext : ApplicationContext
         return new Icon(icon, icon.Size);
     }
 
-    private sealed class MessageWindow : NativeWindow, IDisposable
-    {
-        private static readonly nint MessageOnlyWindow = new(-3);
-
-        public MessageWindow()
-        {
-            CreateHandle(new CreateParams
-            {
-                Caption = "StillTouch Message Window",
-                Parent = MessageOnlyWindow,
-            });
-        }
-
-        public void Dispose() => DestroyHandle();
-    }
 }

@@ -14,6 +14,7 @@ var tests = new (string Name, Action Run)[]
     ("input source classification", InputSourceClassification),
     ("virtual desktop normalization", VirtualDesktopNormalization),
     ("touch device display mapping", TouchDeviceDisplayMapping),
+    ("raw logical range fills display", RawLogicalRangeFillsDisplay),
     ("abnormal drag can be released", AbnormalDragCanBeReleased),
     ("native window procedure forwarding", NativeWindowProcedureForwarding),
     ("raw tap without native promotion", RawTapWithoutNativePromotion),
@@ -126,6 +127,16 @@ static void TouchDeviceDisplayMapping()
     Assert(
         GestureRecognitionService.ScaleCoordinate(500, 0, 1000, -1920, 0) is >= -961 and <= -960,
         "touch device midpoint must map proportionally into the display rectangle");
+}
+
+static void RawLogicalRangeFillsDisplay()
+{
+    Assert(
+        GestureRecognitionService.ScaleCoordinate(32767, 0, 32767, 0, 3000) == 2999,
+        "the HID logical maximum must reach the display edge instead of a top-left subregion");
+    Assert(
+        GestureRecognitionService.ScaleCoordinate(16384, 0, 32767, 0, 3000) is >= 1499 and <= 1500,
+        "the HID logical midpoint must map to the display midpoint");
 }
 
 static void AbnormalDragCanBeReleased()

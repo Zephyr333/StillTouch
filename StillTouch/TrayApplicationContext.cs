@@ -11,6 +11,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
     private System.Windows.Forms.Timer? _exitTimer;
+    private System.Threading.Timer? _exitWatchdog;
     private GlobalTouchMouseService? _service;
     private bool _exitRequested;
 
@@ -97,8 +98,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
 
         _exitRequested = true;
+        RuntimeLog.Write("收到退出请求；输入处理已立即切换为放行模式。");
+        _service?.EnterFailOpenMode();
         _trayIcon.Visible = false;
         _trayIcon.ContextMenuStrip?.Close();
+
+        // If a native cleanup call ever blocks, terminate the process so Windows removes the
+        // global hook. Input has already been put in fail-open mode and all buttons released.
+        _exitWatchdog = new System.Threading.Timer(
+            _ => Environment.Exit(0),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
 
         // Leave the ToolStrip click callback before tearing down hooks and native tray resources.
         _exitTimer = new System.Windows.Forms.Timer { Interval = 1 };
@@ -107,6 +118,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _exitTimer.Stop();
             _exitTimer.Dispose();
             _exitTimer = null;
+
+            RuntimeLog.Write("开始拆除全局输入 Hook。");
+
+            if (_service is not null)
+                _service.DiagnosticMessage -= OnServiceDiagnostic;
+            _service?.Dispose();
+            _service = null;
+            RuntimeLog.Write("全局输入 Hook 已拆除，鼠标按键已释放。");
+
+            _exitWatchdog.Dispose();
+            _exitWatchdog = null;
             ExitThread();
         };
         _exitTimer.Start();
@@ -119,6 +141,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _exitTimer?.Stop();
             _exitTimer?.Dispose();
             _exitTimer = null;
+
+            _exitWatchdog?.Dispose();
+            _exitWatchdog = null;
 
             if (_service is not null)
                 _service.DiagnosticMessage -= OnServiceDiagnostic;

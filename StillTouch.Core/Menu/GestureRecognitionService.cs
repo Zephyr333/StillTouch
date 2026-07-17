@@ -57,6 +57,7 @@ public sealed class GestureRecognitionService : IDisposable
     private readonly WndProcDelegate _wndProc;
     private readonly Dictionary<int, PointerStroke> _activeStrokes = [];
     private readonly Dictionary<nint, ushort> _validRawInputDevices = [];
+    private readonly HashSet<nint> _reportedCoordinateDevices = [];
     private readonly List<PointerStroke> _completedStrokes = [];
     private readonly List<RawContact> _rawContacts = [];
     private readonly Subject<RecognizedGesture> _gestureRecognized = new();
@@ -77,6 +78,8 @@ public sealed class GestureRecognitionService : IDisposable
     internal event Action<TouchContactChange>? TouchContactChanged;
 
     internal event Action<long>? LongPressTimerElapsed;
+
+    internal event Action<string>? DiagnosticMessage;
 
     internal System.Drawing.Point LastGesturePosition { get; private set; }
 
@@ -155,6 +158,7 @@ public sealed class GestureRecognitionService : IDisposable
                         break;
                     case WM_INPUT_DEVICE_CHANGE:
                         _validRawInputDevices.Clear();
+                        _reportedCoordinateDevices.Clear();
                         ResetCapture();
                         PublishTouchReset();
                         break;
@@ -275,20 +279,34 @@ public sealed class GestureRecognitionService : IDisposable
             if (childCount <= 0)
                 childCount = contactCount;
 
-            var physicalMax = GetPhysicalMax(preparsedData.Handle, linkNodes.Length);
+            var logicalBounds = GetLogicalBounds(preparsedData.Handle, linkNodes.Length);
+            if (!logicalBounds.IsValid)
+            {
+                _rawContacts.Clear();
+                _requiredRawContactCount = 0;
+                return false;
+            }
 
             for (int packetIndex = 0; packetIndex < hid.dwCount && _requiredRawContactCount > 0; packetIndex++)
             {
                 nint packet = rawData + packetIndex * (int)hid.dwSizeHid;
                 for (ushort nodeIndex = 1; nodeIndex <= childCount && _requiredRawContactCount > 0; nodeIndex++)
                 {
-                    _rawContacts.Add(ReadRawContact(
-                        (nint)raw.header.hDevice,
-                        preparsedData.Handle,
-                        packet,
-                        (int)hid.dwSizeHid,
-                        nodeIndex,
-                        physicalMax));
+                    if (!TryReadRawContact(
+                            (nint)raw.header.hDevice,
+                            preparsedData.Handle,
+                            packet,
+                            (int)hid.dwSizeHid,
+                            nodeIndex,
+                            logicalBounds,
+                            out var contact))
+                    {
+                        _rawContacts.Clear();
+                        _requiredRawContactCount = 0;
+                        return false;
+                    }
+
+                    _rawContacts.Add(contact);
                     _requiredRawContactCount--;
                 }
             }
@@ -388,7 +406,9 @@ public sealed class GestureRecognitionService : IDisposable
         return nodes;
     }
 
-    private static PointerPoint GetPhysicalMax(PHIDP_PREPARSED_DATA preparsedData, int collectionCount)
+    private static CoordinateBounds GetLogicalBounds(
+        PHIDP_PREPARSED_DATA preparsedData,
+        int collectionCount)
     {
         int count = Math.Max(collectionCount, 1);
         var caps = new HIDP_VALUE_CAPS[count];
@@ -401,9 +421,9 @@ public sealed class GestureRecognitionService : IDisposable
             caps,
             ref capsLength,
             preparsedData);
-        int x = IsHidSuccess(xStatus)
-            ? GetMaxCoordinateValue(caps, capsLength)
-            : 0;
+        var x = IsHidSuccess(xStatus)
+            ? GetLogicalRange(caps, capsLength)
+            : default;
 
         capsLength = (ushort)caps.Length;
         var yStatus = PInvoke.HidP_GetSpecificValueCaps(
@@ -414,34 +434,37 @@ public sealed class GestureRecognitionService : IDisposable
             caps,
             ref capsLength,
             preparsedData);
-        int y = IsHidSuccess(yStatus)
-            ? GetMaxCoordinateValue(caps, capsLength)
-            : 0;
+        var y = IsHidSuccess(yStatus)
+            ? GetLogicalRange(caps, capsLength)
+            : default;
 
         return new(x, y);
     }
 
-    private static int GetMaxCoordinateValue(HIDP_VALUE_CAPS[] caps, ushort capsLength)
+    private static CoordinateRange GetLogicalRange(HIDP_VALUE_CAPS[] caps, ushort capsLength)
     {
         int length = Math.Clamp(capsLength, 0, caps.Length);
         for (int i = 0; i < length; i++)
         {
-            int value = caps[i].PhysicalMax != 0 ? caps[i].PhysicalMax : caps[i].LogicalMax;
-            if (value != 0)
-                return value;
+            int minimum = caps[i].LogicalMin;
+            int maximum = caps[i].LogicalMax;
+            if (maximum > minimum)
+                return new(minimum, maximum);
         }
 
-        return 0;
+        return default;
     }
 
-    private static unsafe RawContact ReadRawContact(
+    private unsafe bool TryReadRawContact(
         nint deviceHandle,
         PHIDP_PREPARSED_DATA preparsedData,
         nint packet,
         int packetSize,
         ushort nodeIndex,
-        PointerPoint physicalMax)
+        CoordinateBounds logicalBounds,
+        out RawContact contact)
     {
+        contact = default;
         uint contactId = 0;
         _ = PInvoke.HidP_GetUsageValue(
             HIDP_REPORT_TYPE.HidP_Input,
@@ -453,30 +476,38 @@ public sealed class GestureRecognitionService : IDisposable
             new PSTR((byte*)packet),
             (uint)packetSize);
 
-        int physicalX = 0;
-        int physicalY = 0;
-        _ = PInvoke.HidP_GetScaledUsageValue(
+        uint logicalX = 0;
+        uint logicalY = 0;
+        var xStatus = PInvoke.HidP_GetUsageValue(
             HIDP_REPORT_TYPE.HidP_Input,
             GenericDesktopPage,
             nodeIndex,
             XCoordinateId,
-            out physicalX,
+            out logicalX,
             preparsedData,
             new PSTR((byte*)packet),
             (uint)packetSize);
-        _ = PInvoke.HidP_GetScaledUsageValue(
+        var yStatus = PInvoke.HidP_GetUsageValue(
             HIDP_REPORT_TYPE.HidP_Input,
             GenericDesktopPage,
             nodeIndex,
             YCoordinateId,
-            out physicalY,
+            out logicalY,
             preparsedData,
             new PSTR((byte*)packet),
             (uint)packetSize);
 
-        var point = ScaleToScreen(deviceHandle, physicalX, physicalY, physicalMax);
+        if (!IsHidSuccess(xStatus) || !IsHidSuccess(yStatus))
+            return false;
+
+        var point = ScaleToScreen(
+            deviceHandle,
+            unchecked((int)logicalX),
+            unchecked((int)logicalY),
+            logicalBounds);
         bool isTip = IsTipContact(preparsedData, packet, packetSize, nodeIndex);
-        return new((int)contactId, isTip, point);
+        contact = new((int)contactId, isTip, point);
+        return true;
     }
 
     private static unsafe bool IsTipContact(PHIDP_PREPARSED_DATA preparsedData, nint packet, int packetSize, ushort nodeIndex)
@@ -510,11 +541,11 @@ public sealed class GestureRecognitionService : IDisposable
             usages.Take((int)usageLength).Contains(TipId);
     }
 
-    private static unsafe PointerPoint ScaleToScreen(
+    private unsafe PointerPoint ScaleToScreen(
         nint deviceHandle,
-        int physicalX,
-        int physicalY,
-        PointerPoint physicalMax)
+        int logicalX,
+        int logicalY,
+        CoordinateBounds logicalBounds)
     {
         RECT deviceRect;
         RECT displayRect;
@@ -524,29 +555,79 @@ public sealed class GestureRecognitionService : IDisposable
                 &deviceRect,
                 &displayRect))
         {
+            ReportCoordinateMappingOnce(
+                deviceHandle,
+                logicalBounds,
+                deviceRect,
+                displayRect,
+                usedPointerMapping: true);
             return new(
                 ScaleCoordinate(
-                    physicalX,
-                    deviceRect.left,
-                    deviceRect.right,
+                    logicalX,
+                    logicalBounds.X.Minimum,
+                    logicalBounds.X.Maximum,
                     displayRect.left,
                     displayRect.right),
                 ScaleCoordinate(
-                    physicalY,
-                    deviceRect.top,
-                    deviceRect.bottom,
+                    logicalY,
+                    logicalBounds.Y.Minimum,
+                    logicalBounds.Y.Maximum,
                     displayRect.top,
                     displayRect.bottom));
         }
 
-        if (physicalMax.X <= 0 || physicalMax.Y <= 0)
-            return new(physicalX, physicalY);
-
         int screenWidth = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXSCREEN));
         int screenHeight = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYSCREEN));
+        displayRect = new RECT(0, 0, screenWidth, screenHeight);
+        ReportCoordinateMappingOnce(
+            deviceHandle,
+            logicalBounds,
+            default,
+            displayRect,
+            usedPointerMapping: false);
         return new(
-            ScaleCoordinate(physicalX, 0, physicalMax.X, 0, screenWidth),
-            ScaleCoordinate(physicalY, 0, physicalMax.Y, 0, screenHeight));
+            ScaleCoordinate(
+                logicalX,
+                logicalBounds.X.Minimum,
+                logicalBounds.X.Maximum,
+                0,
+                screenWidth),
+            ScaleCoordinate(
+                logicalY,
+                logicalBounds.Y.Minimum,
+                logicalBounds.Y.Maximum,
+                0,
+                screenHeight));
+    }
+
+    private void ReportCoordinateMappingOnce(
+        nint deviceHandle,
+        CoordinateBounds logicalBounds,
+        RECT pointerDeviceRect,
+        RECT displayRect,
+        bool usedPointerMapping)
+    {
+        if (!_reportedCoordinateDevices.Add(deviceHandle))
+            return;
+
+        string pointerRange = usedPointerMapping
+            ? $"HIMETRIC=({pointerDeviceRect.left},{pointerDeviceRect.top}).." +
+              $"({pointerDeviceRect.right},{pointerDeviceRect.bottom})"
+            : "HIMETRIC=不可用，回退到主显示器";
+        string message =
+            $"触摸坐标映射：Logical=({logicalBounds.X.Minimum},{logicalBounds.Y.Minimum}).." +
+            $"({logicalBounds.X.Maximum},{logicalBounds.Y.Maximum})；{pointerRange}；" +
+            $"Display=({displayRect.left},{displayRect.top}).." +
+            $"({displayRect.right},{displayRect.bottom})。";
+
+        try
+        {
+            DiagnosticMessage?.Invoke(message);
+        }
+        catch
+        {
+            // Diagnostics must never interfere with the global input path.
+        }
     }
 
     internal static int ScaleCoordinate(
@@ -797,6 +878,16 @@ public sealed class GestureRecognitionService : IDisposable
     private readonly record struct RawContact(int Id, bool IsTip, PointerPoint Point);
 
     private readonly record struct PointerPoint(int X, int Y);
+
+    private readonly record struct CoordinateRange(int Minimum, int Maximum)
+    {
+        public bool IsValid => Maximum > Minimum;
+    }
+
+    private readonly record struct CoordinateBounds(CoordinateRange X, CoordinateRange Y)
+    {
+        public bool IsValid => X.IsValid && Y.IsValid;
+    }
 
     private sealed class PointerStroke
     {

@@ -53,6 +53,10 @@ internal static class AbsoluteMouseInput
             CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_LEFTUP));
     }
 
+    public static bool ReleaseButtons() => Send(
+        CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_LEFTUP),
+        CreateButton(MOUSE_EVENT_FLAGS.MOUSEEVENTF_RIGHTUP));
+
     internal static int NormalizeCoordinate(int coordinate, int virtualOrigin, int virtualSize)
     {
         if (virtualSize <= 1)
@@ -116,4 +120,5 @@ internal static class AbsoluteMouseInput
             return sent == inputs.Length;
         }
     }
+
 }

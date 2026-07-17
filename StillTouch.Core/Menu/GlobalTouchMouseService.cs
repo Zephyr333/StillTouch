@@ -27,7 +27,8 @@ public sealed class GlobalTouchMouseService : IDisposable
     private UnhookWindowsHookExSafeHandle? _hook;
     private long _suppressedRawSequence = -1;
     private long _suppressionExpiresAtMilliseconds;
-    private volatile bool _disposed;
+    private volatile bool _acceptingInput;
+    private int _disposeStarted;
 
     public event Action<string>? DiagnosticMessage;
 
@@ -40,6 +41,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         _touchMonitor = new GestureRecognitionService(messageWindowHandle);
         _touchMonitor.TouchContactChanged += OnTouchContactChanged;
         _touchMonitor.LongPressTimerElapsed += OnLongPressTimerElapsed;
+        _touchMonitor.DiagnosticMessage += ReportDiagnostic;
         _longPressTimer = new System.Threading.Timer(
             PostLongPressTimerMessage,
             null,
@@ -58,6 +60,7 @@ public sealed class GlobalTouchMouseService : IDisposable
             if (_hook.IsInvalid)
                 throw new Win32Exception();
 
+            _acceptingInput = true;
             _touchMonitor.IsEnabled = true;
         }
         catch
@@ -67,6 +70,7 @@ public sealed class GlobalTouchMouseService : IDisposable
             _longPressTimer.Dispose();
             _touchMonitor.TouchContactChanged -= OnTouchContactChanged;
             _touchMonitor.LongPressTimerElapsed -= OnLongPressTimerElapsed;
+            _touchMonitor.DiagnosticMessage -= ReportDiagnostic;
             _touchMonitor.Dispose();
             throw;
         }
@@ -74,18 +78,19 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
             return;
 
-        _disposed = true;
+        EnterFailOpenMode();
         _touchMonitor.TouchContactChanged -= OnTouchContactChanged;
         _touchMonitor.LongPressTimerElapsed -= OnLongPressTimerElapsed;
-        _ = _longPressTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        _touchMonitor.DiagnosticMessage -= ReportDiagnostic;
 
-        // Stop callbacks before releasing any replayed button so shutdown cannot create a new hook state.
+        // Stop the hook before the final button release. Hook callbacks always forward with a null
+        // handle, so disposing the SafeHandle cannot race CallNextHookEx during shutdown.
         _hook?.Dispose();
         _hook = null;
-        ReleaseReplayedDragIfNeeded();
+        _ = AbsoluteMouseInput.ReleaseButtons();
         _mouseState.Reset();
         _rawTouchState.Reset();
         _suppressedRawSequence = -1;
@@ -95,9 +100,19 @@ public sealed class GlobalTouchMouseService : IDisposable
         _touchMonitor.Dispose();
     }
 
+    public void EnterFailOpenMode()
+    {
+        _acceptingInput = false;
+        CancelLongPressTimer();
+
+        // A partially replayed drag must never survive disabling or process shutdown. Releasing
+        // both buttons is idempotent and also recovers from a partial SendInput sequence.
+        _ = AbsoluteMouseInput.ReleaseButtons();
+    }
+
     private LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
     {
-        if (nCode < 0 || lParam.Value == 0 || _disposed)
+        if (nCode < 0 || lParam.Value == 0 || !_acceptingInput)
             return CallNext(nCode, wParam, lParam);
 
         try
@@ -160,7 +175,7 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void OnTouchContactChanged(TouchContactChange change)
     {
-        if (_disposed)
+        if (!_acceptingInput)
             return;
 
         if (change.Kind == TouchContactChangeKind.Reset)
@@ -179,7 +194,7 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void OnLongPressTimerElapsed(long nowMilliseconds)
     {
-        if (_disposed)
+        if (!_acceptingInput)
             return;
 
         var decision = _rawTouchState.TryTriggerLongPress(nowMilliseconds);
@@ -213,7 +228,7 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void PostLongPressTimerMessage(object? state)
     {
-        if (_disposed)
+        if (!_acceptingInput)
             return;
 
         _ = PInvoke.PostMessage(
@@ -225,7 +240,7 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void ExecuteRawDecision(RawTouchClickDecision decision)
     {
-        if (decision.Action == RawTouchClickAction.None || _disposed)
+        if (decision.Action == RawTouchClickAction.None || !_acceptingInput)
             return;
 
         bool succeeded = AbsoluteMouseInput.Click(
@@ -241,6 +256,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         else
         {
             int error = Marshal.GetLastPInvokeError();
+            _ = AbsoluteMouseInput.ReleaseButtons();
             _rawTouchState.MarkInjectionFailed(decision.Sequence);
             Debug.WriteLine(
                 $"SendInput failed for raw {decision.Action}; Win32 error {error}.");
@@ -255,13 +271,14 @@ public sealed class GlobalTouchMouseService : IDisposable
             !AbsoluteMouseInput.ReleaseLeft(point))
         {
             int error = Marshal.GetLastPInvokeError();
+            _ = AbsoluteMouseInput.ReleaseButtons();
             Debug.WriteLine($"Failed to release replayed left drag; Win32 error {error}.");
             ReportDiagnostic($"释放拖动左键失败，Win32 错误 {error}。");
         }
     }
 
     private LRESULT CallNext(int nCode, WPARAM wParam, LPARAM lParam) =>
-        PInvoke.CallNextHookEx(_hook, nCode, wParam, lParam);
+        PInvoke.CallNextHookEx(null, nCode, wParam, lParam);
 
     private void ExecuteMouseDecision(TouchMouseDecision decision)
     {
@@ -278,6 +295,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (!succeeded)
         {
             int error = Marshal.GetLastPInvokeError();
+            _ = AbsoluteMouseInput.ReleaseButtons();
             Debug.WriteLine($"SendInput failed for {decision.Action}; Win32 error {error}.");
             ReportDiagnostic(
                 $"兼容触摸转换 {decision.Action} 的 SendInput 失败，Win32 错误 {error}。");

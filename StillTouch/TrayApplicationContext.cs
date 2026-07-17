@@ -10,7 +10,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly Icon _enabledIcon;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
+    private System.Windows.Forms.Timer? _exitTimer;
     private GlobalTouchMouseService? _service;
+    private bool _exitRequested;
 
     public TrayApplicationContext()
     {
@@ -18,7 +20,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _enabledIcon = LoadAppIcon();
 
         var exitItem = new ToolStripMenuItem("退出");
-        exitItem.Click += (_, _) => ExitThread();
+        exitItem.Click += (_, _) => RequestExit();
 
         _statusItem = new ToolStripMenuItem { Enabled = false };
 
@@ -50,7 +52,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void EnableService(bool showNotification)
     {
-        _service = new GlobalTouchMouseService(_messageWindow.Handle);
+        var service = new GlobalTouchMouseService(_messageWindow.Handle);
+        service.DiagnosticMessage += OnServiceDiagnostic;
+        _service = service;
+        RuntimeLog.WriteAsync("触摸转鼠标功能已开启。");
         UpdateTrayState(isEnabled: true);
         if (showNotification)
             ShowStateNotification("功能已开启");
@@ -58,8 +63,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void DisableService(bool showNotification)
     {
+        if (_service is not null)
+            _service.DiagnosticMessage -= OnServiceDiagnostic;
         _service?.Dispose();
         _service = null;
+        RuntimeLog.WriteAsync("触摸转鼠标功能已关闭。");
         UpdateTrayState(isEnabled: false);
         if (showNotification)
             ShowStateNotification("功能已关闭");
@@ -81,14 +89,49 @@ internal sealed class TrayApplicationContext : ApplicationContext
             message,
             ToolTipIcon.Info);
 
+    private static void OnServiceDiagnostic(string message) => RuntimeLog.WriteAsync(message);
+
+    private void RequestExit()
+    {
+        if (_exitRequested)
+            return;
+
+        _exitRequested = true;
+        _trayIcon.Visible = false;
+        _trayIcon.ContextMenuStrip?.Close();
+
+        // Leave the ToolStrip click callback before tearing down hooks and native tray resources.
+        _exitTimer = new System.Windows.Forms.Timer { Interval = 1 };
+        _exitTimer.Tick += (_, _) =>
+        {
+            _exitTimer.Stop();
+            _exitTimer.Dispose();
+            _exitTimer = null;
+            ExitThread();
+        };
+        _exitTimer.Start();
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            _trayIcon.Visible = false;
-            _trayIcon.Dispose();
-            _enabledIcon.Dispose();
+            _exitTimer?.Stop();
+            _exitTimer?.Dispose();
+            _exitTimer = null;
+
+            if (_service is not null)
+                _service.DiagnosticMessage -= OnServiceDiagnostic;
             _service?.Dispose();
+            _service = null;
+            RuntimeLog.WriteAsync("StillTouch 已退出。");
+
+            _trayIcon.Visible = false;
+            var contextMenu = _trayIcon.ContextMenuStrip;
+            _trayIcon.ContextMenuStrip = null;
+            _trayIcon.Dispose();
+            contextMenu?.Dispose();
+            _enabledIcon.Dispose();
             _messageWindow.Dispose();
         }
 

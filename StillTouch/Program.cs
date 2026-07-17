@@ -28,48 +28,17 @@ internal static class Program
         try
         {
             ApplicationConfiguration.Initialize();
+            RuntimeLog.WriteSessionHeader();
             Application.Run(new TrayApplicationContext());
         }
         catch (Exception ex)
         {
-            string logPath = WriteStartupLog(ex);
+            string logPath = RuntimeLog.Write($"启动失败：{ex}");
             MessageBox.Show(
                 $"启动失败：{ex.Message}\n\n错误类型：{ex.GetType().Name}\n详细日志：{logPath}",
                 "StillTouch",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
-    }
-
-    private static string WriteStartupLog(Exception exception)
-    {
-        const string fileName = "StillTouch-startup.log";
-        string contents =
-            $"Time: {DateTimeOffset.Now:O}{Environment.NewLine}" +
-            $"OS: {Environment.OSVersion}{Environment.NewLine}" +
-            $"Process architecture: {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}{Environment.NewLine}" +
-            $"Framework: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}{Environment.NewLine}" +
-            $"{Environment.NewLine}{exception}";
-
-        string[] paths =
-        {
-            Path.Combine(AppContext.BaseDirectory, fileName),
-            Path.Combine(Path.GetTempPath(), fileName),
-        };
-
-        foreach (string path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            try
-            {
-                File.WriteAllText(path, contents);
-                return path;
-            }
-            catch
-            {
-                // Try the fallback path so a read-only application directory does not hide the error.
-            }
-        }
-
-        return "无法写入日志";
     }
 }

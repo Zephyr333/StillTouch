@@ -13,8 +13,16 @@ var tests = new (string Name, Action Run)[]
     ("unknown sequence passes through", UnknownSequencePassesThrough),
     ("input source classification", InputSourceClassification),
     ("virtual desktop normalization", VirtualDesktopNormalization),
+    ("touch device display mapping", TouchDeviceDisplayMapping),
     ("abnormal drag can be released", AbnormalDragCanBeReleased),
     ("native window procedure forwarding", NativeWindowProcedureForwarding),
+    ("raw tap without native promotion", RawTapWithoutNativePromotion),
+    ("raw long press without native right click", RawLongPressWithoutNativeRightClick),
+    ("raw movement cancels conversion", RawMovementCancelsConversion),
+    ("raw multi-touch cancels conversion", RawMultiTouchCancelsConversion),
+    ("same-position rapid taps stay independent", SamePositionRapidTapsStayIndependent),
+    ("native fallback cannot duplicate raw click", NativeFallbackCannotDuplicateRawClick),
+    ("raw reset cancels pending input", RawResetCancelsPendingInput),
 };
 
 int failed = 0;
@@ -107,6 +115,19 @@ static void VirtualDesktopNormalization()
     Assert(center is >= 32760 and <= 32776, "negative-origin midpoint was normalized incorrectly");
 }
 
+static void TouchDeviceDisplayMapping()
+{
+    Assert(
+        GestureRecognitionService.ScaleCoordinate(0, 0, 1000, -1920, 0) == -1920,
+        "touch device left edge must map to a negative-origin display");
+    Assert(
+        GestureRecognitionService.ScaleCoordinate(1000, 0, 1000, -1920, 0) == -1,
+        "touch device right edge must remain inside the mapped display");
+    Assert(
+        GestureRecognitionService.ScaleCoordinate(500, 0, 1000, -1920, 0) is >= -961 and <= -960,
+        "touch device midpoint must map proportionally into the display rectangle");
+}
+
 static void AbnormalDragCanBeReleased()
 {
     var machine = new TouchMouseStateMachine();
@@ -126,6 +147,95 @@ static void NativeWindowProcedureForwarding()
     GC.KeepAlive(callback);
     Assert(result == new nint(12345), "native function pointer must be forwarded without recasting the managed delegate");
 }
+
+static void RawTapWithoutNativePromotion()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 100, 200, 1, 1, 1000), 12);
+    var click = machine.Process(Contact(1, TouchContactChangeKind.Up, 102, 201, 0, 1, 1060), 12);
+
+    Assert(click.Action == RawTouchClickAction.LeftClick, "raw touch-up must create a left click without native mouse messages");
+    Assert(click.Position == new Point(102, 201), "raw click must use the final touch coordinate");
+}
+
+static void RawLongPressWithoutNativeRightClick()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 300, 400, 1, 1, 2000), 12);
+    Assert(machine.TryTriggerLongPress(2449).Action == RawTouchClickAction.None, "long press must not fire early");
+
+    var rightClick = machine.TryTriggerLongPress(2450);
+    var up = machine.Process(Contact(1, TouchContactChangeKind.Up, 300, 400, 0, 1, 2500), 12);
+    Assert(rightClick.Action == RawTouchClickAction.RightClick, "stationary hold must create a right click without native promotion");
+    Assert(up.Action == RawTouchClickAction.None, "lifting after a long press must not add a left click");
+}
+
+static void RawMovementCancelsConversion()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 0, 0, 1, 1, 3000), 12);
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Move, 30, 0, 1, 1, 3020), 12);
+    var up = machine.Process(Contact(1, TouchContactChangeKind.Up, 50, 0, 0, 1, 3060), 12);
+
+    Assert(machine.TryTriggerLongPress(3500).Action == RawTouchClickAction.None, "moved touch must not long-press");
+    Assert(up.Action == RawTouchClickAction.None, "moved touch must not click");
+}
+
+static void RawMultiTouchCancelsConversion()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 10, 10, 1, 1, 4000), 12);
+    _ = machine.Process(Contact(2, TouchContactChangeKind.Down, 20, 20, 2, 2, 4010), 12);
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Up, 10, 10, 1, 2, 4050), 12);
+    var finalUp = machine.Process(Contact(2, TouchContactChangeKind.Up, 20, 20, 0, 2, 4060), 12);
+
+    Assert(finalUp.Action == RawTouchClickAction.None, "multi-touch sequence must not inject a click");
+}
+
+static void SamePositionRapidTapsStayIndependent()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 500, 500, 1, 1, 5000), 12);
+    var first = machine.Process(Contact(1, TouchContactChangeKind.Up, 500, 500, 0, 1, 5040), 12);
+    _ = machine.Process(Contact(2, TouchContactChangeKind.Down, 500, 500, 1, 1, 5100), 12);
+    var second = machine.Process(Contact(2, TouchContactChangeKind.Up, 500, 500, 0, 1, 5140), 12);
+
+    Assert(first.Action == RawTouchClickAction.LeftClick && second.Action == RawTouchClickAction.LeftClick,
+        "two taps at exactly the same coordinate must create two clicks");
+    Assert(second.Sequence == first.Sequence + 1, "rapid taps must use independent suppression sequences");
+}
+
+static void NativeFallbackCannotDuplicateRawClick()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 40, 50, 1, 1, 6000), 12);
+    Assert(machine.TryAdoptNativeClick(RawTouchClickAction.LeftClick, new(40, 50), 6040, out var adopted),
+        "native click should be adopted while raw contact is pending");
+    var rawUp = machine.Process(Contact(1, TouchContactChangeKind.Up, 40, 50, 0, 1, 6050), 12);
+
+    Assert(adopted.Action == RawTouchClickAction.LeftClick, "adopted click must preserve button intent");
+    Assert(rawUp.Action == RawTouchClickAction.None, "raw completion must not duplicate an adopted native click");
+}
+
+static void RawResetCancelsPendingInput()
+{
+    var machine = new RawTouchClickStateMachine();
+    _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 70, 80, 1, 1, 7000), 12);
+    _ = machine.Process(Contact(0, TouchContactChangeKind.Reset, 0, 0, 0, 0, 7010), 12);
+
+    Assert(!machine.HasConvertibleCandidate, "reset must clear pending conversion state");
+    Assert(machine.TryTriggerLongPress(8000).Action == RawTouchClickAction.None, "reset must cancel delayed right click");
+}
+
+static TouchContactChange Contact(
+    int id,
+    TouchContactChangeKind kind,
+    int x,
+    int y,
+    int active,
+    int max,
+    long timestamp) =>
+    new(id, kind, new Point(x, y), active, max, timestamp);
 
 static TouchContactSnapshot Snapshot(int active, int max, long updatedAt) =>
     new(active, max, updatedAt);

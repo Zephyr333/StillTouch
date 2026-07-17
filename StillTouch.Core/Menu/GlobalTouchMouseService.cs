@@ -16,17 +16,14 @@ public sealed class GlobalTouchMouseService : IDisposable
     private const uint WM_LBUTTONUP = 0x0202;
     private const uint WM_RBUTTONDOWN = 0x0204;
     private const uint WM_RBUTTONUP = 0x0205;
-    private const int RawSuppressionWindowMilliseconds = 2000;
-
     private readonly nint _messageWindowHandle;
     private readonly HOOKPROC _hookProc;
     private readonly GestureRecognitionService _touchMonitor;
     private readonly TouchMouseStateMachine _mouseState = new();
     private readonly RawTouchClickStateMachine _rawTouchState = new();
+    private readonly PromotedMouseSuppressionState _promotedMouseSuppression = new();
     private readonly System.Threading.Timer _longPressTimer;
     private UnhookWindowsHookExSafeHandle? _hook;
-    private long _suppressedRawSequence = -1;
-    private long _suppressionExpiresAtMilliseconds;
     private volatile bool _acceptingInput;
     private int _disposeStarted;
 
@@ -93,8 +90,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         _ = AbsoluteMouseInput.ReleaseButtons();
         _mouseState.Reset();
         _rawTouchState.Reset();
-        _suppressedRawSequence = -1;
-        _suppressionExpiresAtMilliseconds = 0;
+        _promotedMouseSuppression.Clear();
 
         _longPressTimer.Dispose();
         _touchMonitor.Dispose();
@@ -134,9 +130,11 @@ public sealed class GlobalTouchMouseService : IDisposable
             }
 
             long now = Environment.TickCount64;
-            if (_suppressedRawSequence == _rawTouchState.CurrentSequence &&
-                now <= _suppressionExpiresAtMilliseconds &&
-                IsButtonMessage(message))
+            if (_promotedMouseSuppression.ShouldSuppress(
+                    message,
+                    _rawTouchState.CurrentSequence,
+                    now,
+                    _mouseState.IsReplayedDrag))
             {
                 return new LRESULT(1);
             }
@@ -184,7 +182,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (!_acceptingInput)
             return;
 
-        if (change.Kind == TouchContactChangeKind.Reset)
+        if (change.Kind is TouchContactChangeKind.Down or TouchContactChangeKind.Reset)
             ClearRawSuppression();
 
         int threshold = change.Kind == TouchContactChangeKind.Reset
@@ -194,7 +192,8 @@ public sealed class GlobalTouchMouseService : IDisposable
         ScheduleLongPressTimer(change.TimestampMilliseconds);
         ExecuteRawDecision(decision);
 
-        if (change.ActiveContactCount == 0)
+        if (change.Kind is TouchContactChangeKind.Up or TouchContactChangeKind.Reset ||
+            change.ActiveContactCount == 0)
             ReleaseReplayedDragIfNeeded();
     }
 
@@ -254,9 +253,9 @@ public sealed class GlobalTouchMouseService : IDisposable
             rightButton: decision.Action == RawTouchClickAction.RightClick);
         if (succeeded)
         {
-            _suppressedRawSequence = decision.Sequence;
-            _suppressionExpiresAtMilliseconds =
-                Environment.TickCount64 + RawSuppressionWindowMilliseconds;
+            _promotedMouseSuppression.MarkRawClick(
+                decision.Sequence,
+                Environment.TickCount64);
             _mouseState.Reset();
         }
         else
@@ -294,6 +293,7 @@ public sealed class GlobalTouchMouseService : IDisposable
             TouchMouseAction.LeftClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: false),
             TouchMouseAction.RightClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: true),
             TouchMouseAction.BeginLeftDrag => AbsoluteMouseInput.BeginLeftDrag(decision.StartPoint, decision.EndPoint),
+            TouchMouseAction.EndLeftDrag => AbsoluteMouseInput.ReleaseLeft(decision.EndPoint),
             TouchMouseAction.CompleteLeftDrag => AbsoluteMouseInput.CompleteLeftDrag(decision.StartPoint, decision.EndPoint),
             _ => true,
         };
@@ -310,8 +310,7 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void ClearRawSuppression()
     {
-        _suppressedRawSequence = -1;
-        _suppressionExpiresAtMilliseconds = 0;
+        _promotedMouseSuppression.Clear();
     }
 
     private void ReportDiagnostic(string message)
@@ -335,13 +334,6 @@ public sealed class GlobalTouchMouseService : IDisposable
 
         return Math.Max(8, (int)Math.Ceiling(12.0 * dpi / 96.0));
     }
-
-    private static bool IsButtonMessage(TouchMouseMessage message) =>
-        message is
-            TouchMouseMessage.LeftDown or
-            TouchMouseMessage.LeftUp or
-            TouchMouseMessage.RightDown or
-            TouchMouseMessage.RightUp;
 
     private static bool TryMapMessage(uint message, out TouchMouseMessage mapped)
     {

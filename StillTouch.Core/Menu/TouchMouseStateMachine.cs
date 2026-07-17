@@ -17,6 +17,7 @@ internal enum TouchMouseAction
     LeftClick,
     RightClick,
     BeginLeftDrag,
+    EndLeftDrag,
     CompleteLeftDrag,
 }
 
@@ -32,6 +33,8 @@ internal sealed class TouchMouseStateMachine
 
     private Candidate? _candidate;
     private State _state;
+
+    public bool IsReplayedDrag => _state == State.ReplayedDrag;
 
     public TouchMouseDecision Process(
         TouchMouseMessage message,
@@ -144,8 +147,13 @@ internal sealed class TouchMouseStateMachine
 
         if (_state == State.ReplayedDrag)
         {
+            var decision = new TouchMouseDecision(
+                true,
+                TouchMouseAction.EndLeftDrag,
+                candidate.StartPoint,
+                candidate.LastPoint);
             Reset();
-            return default;
+            return decision;
         }
 
         if (_state == State.Candidate &&

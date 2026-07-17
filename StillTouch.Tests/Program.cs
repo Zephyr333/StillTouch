@@ -22,6 +22,8 @@ var tests = new (string Name, Action Run)[]
     ("raw movement cancels conversion", RawMovementCancelsConversion),
     ("raw multi-touch cancels conversion", RawMultiTouchCancelsConversion),
     ("same-position rapid taps stay independent", SamePositionRapidTapsStayIndependent),
+    ("next promoted down escapes stale suppression", NextPromotedDownEscapesStaleSuppression),
+    ("drag up escapes raw suppression", DragUpEscapesRawSuppression),
     ("native fallback cannot duplicate raw click", NativeFallbackCannotDuplicateRawClick),
     ("raw reset cancels pending input", RawResetCancelsPendingInput),
 };
@@ -71,7 +73,10 @@ static void SingleDrag()
     var move = machine.Process(TouchMouseMessage.Move, new(50, 20), Snapshot(1, 1, 3010), 3010, 12);
     var up = machine.Process(TouchMouseMessage.LeftUp, new(80, 20), Snapshot(0, 1, 3090), 3100, 12);
     Assert(move.Suppress && move.Action == TouchMouseAction.BeginLeftDrag, "threshold crossing must replay the original down and current move");
-    Assert(!up.Suppress && up.Action == TouchMouseAction.None, "native drag up must pass through");
+    Assert(up.Suppress && up.Action == TouchMouseAction.EndLeftDrag,
+        "drag up must be suppressed and replayed explicitly");
+    Assert(up.EndPoint == new Point(80, 20), "drag release must use the final touch coordinate");
+    Assert(!machine.IsReplayedDrag, "drag release must clear the held-button state");
 }
 
 static void MultiTouchFromStart()
@@ -214,6 +219,28 @@ static void SamePositionRapidTapsStayIndependent()
     Assert(first.Action == RawTouchClickAction.LeftClick && second.Action == RawTouchClickAction.LeftClick,
         "two taps at exactly the same coordinate must create two clicks");
     Assert(second.Sequence == first.Sequence + 1, "rapid taps must use independent suppression sequences");
+}
+
+static void NextPromotedDownEscapesStaleSuppression()
+{
+    var suppression = new PromotedMouseSuppressionState();
+    suppression.MarkRawClick(7, 5000);
+
+    Assert(suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 7, 5050, false),
+        "the duplicate up from the converted raw click must be suppressed");
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftDown, 7, 5100, false),
+        "a new promoted down must start a new tap even before the raw sequence advances");
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 7, 5140, false),
+        "clearing at the new down must keep its matching up available to the fallback path");
+}
+
+static void DragUpEscapesRawSuppression()
+{
+    var suppression = new PromotedMouseSuppressionState();
+    suppression.MarkRawClick(9, 6000);
+
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 9, 6050, true),
+        "raw click suppression must never swallow the up for an injected drag down");
 }
 
 static void NativeFallbackCannotDuplicateRawClick()

@@ -1,0 +1,98 @@
+name: Build tagged release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore .\StillTouch.slnx
+
+      - name: Build with warnings as errors
+        run: dotnet build .\StillTouch.slnx -c Release --no-restore -warnaserror
+
+      - name: Run tests
+        run: dotnet run --project .\StillTouch.Tests\StillTouch.Tests.csproj -c Release --no-build
+
+      - name: Publish single-file executable
+        run: dotnet publish .\StillTouch\StillTouch.csproj -c Release -r win-x64 --self-contained true --no-restore -warnaserror -o .\artifacts
+
+      - name: Validate release artifact
+        id: artifact
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath .\artifacts -File)
+          if ($files.Count -ne 1 -or $files[0].Name -ne "StillTouch.exe") {
+            throw "Expected exactly one release file named StillTouch.exe."
+          }
+
+          $hash = (Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Replace only an empty draft for this tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $releaseJson = gh release view $tag --repo "${{ github.repository }}" --json isDraft,assets 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            exit 0
+          }
+
+          $release = $releaseJson | ConvertFrom-Json
+          if (-not $release.isDraft -or @($release.assets).Count -ne 0) {
+            throw "Refusing to replace a published or non-empty release for $tag."
+          }
+
+          gh release delete $tag --repo "${{ github.repository }}" --yes
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $hash = "${{ steps.artifact.outputs.sha256 }}"
+          $notes = @"
+          StillTouch 单文件 Windows x64 版本。
+
+          验证：警告即错误构建通过，全部自动化测试通过。
+
+          SHA-256：$hash
+
+          此 EXE 尚未数字签名，UAC 显示“未知发布者”属于预期行为。
+          "@
+
+          $arguments = @(
+            "release", "create", $tag, ".\artifacts\StillTouch.exe",
+            "--repo", "${{ github.repository }}",
+            "--verify-tag",
+            "--title", "StillTouch $tag",
+            "--notes", $notes
+          )
+          if ($tag.Contains("-")) {
+            $arguments += "--prerelease"
+          }
+
+          gh @arguments

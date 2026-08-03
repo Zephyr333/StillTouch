@@ -25,11 +25,24 @@ internal static class Program
             return;
         }
 
+        var mouseInput = new StillTouch.Core.AbsoluteMouseInput();
+        var finalTermination = new FinalTerminationCoordinator(mouseInput);
+        // Deliberately not disposed: once armed, the process-wide watchdog must remain active
+        // even if native termination throws or an exception path reaches the outer catch block.
+        var shutdownWatchdog = new ShutdownWatchdog(
+            TimeSpan.FromSeconds(3),
+            finalTermination.Terminate);
         try
         {
             ApplicationConfiguration.Initialize();
             RuntimeLog.WriteSessionHeader();
-            Application.Run(new TrayApplicationContext());
+            var trayContext = new TrayApplicationContext(shutdownWatchdog, mouseInput);
+            Application.Run(trayContext);
+
+            // Application.Run returns only after TrayApplicationContext.Dispose has completed.
+            // Give only this process's confirmed synthetic buttons a bounded final release chance,
+            // then use native termination to avoid a second CLR/DLL-detach shutdown path.
+            finalTermination.Terminate();
         }
         catch (Exception ex)
         {

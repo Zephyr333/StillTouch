@@ -1,5 +1,5 @@
+using System.Reflection;
 using System.Runtime.Versioning;
-using System.Diagnostics;
 using StillTouch.Core;
 
 namespace StillTouch;
@@ -7,42 +7,88 @@ namespace StillTouch;
 [SupportedOSPlatform("windows10.0.19041")]
 internal sealed class TrayApplicationContext : ApplicationContext
 {
-    private readonly MessageWindow _messageWindow;
+    private readonly ShutdownWatchdog _shutdownWatchdog;
+    private readonly InputThreadHost _inputHost;
     private readonly Icon _enabledIcon;
+    private readonly ContextMenuStrip _contextMenu;
     private readonly NotifyIcon _trayIcon;
+    private readonly ToolStripMenuItem _exitItem;
     private readonly ToolStripMenuItem _statusItem;
     private System.Windows.Forms.Timer? _deferredActionTimer;
-    private System.Threading.Timer? _exitWorker;
-    private System.Threading.Timer? _exitWatchdog;
-    private GlobalTouchMouseService? _service;
     private PendingAction _pendingAction;
-    private bool _exitRequested;
+    private bool _isEnabled = true;
+    private int _exitRequested;
+    private int _disposeStarted;
     private long _ignoreTrayClicksUntil;
 
-    public TrayApplicationContext()
+    public TrayApplicationContext(ShutdownWatchdog shutdownWatchdog)
+        : this(shutdownWatchdog, new AbsoluteMouseInput())
     {
-        _messageWindow = new MessageWindow();
+    }
+
+    internal TrayApplicationContext(
+        ShutdownWatchdog shutdownWatchdog,
+        AbsoluteMouseInput mouseInput)
+    {
+        _shutdownWatchdog = shutdownWatchdog ??
+            throw new ArgumentNullException(nameof(shutdownWatchdog));
         _enabledIcon = LoadAppIcon();
 
-        var exitItem = new ToolStripMenuItem("退出");
-        exitItem.Click += (_, _) => RequestExit();
+        _exitItem = new ToolStripMenuItem("退出");
+        _exitItem.Click += (_, _) => RequestExit();
 
         _statusItem = new ToolStripMenuItem { Enabled = false };
+        _contextMenu = new ContextMenuStrip();
+        _contextMenu.Items.Add(_statusItem);
+        _contextMenu.Items.Add(new ToolStripSeparator());
+        _contextMenu.Items.Add(_exitItem);
 
         _trayIcon = new NotifyIcon
         {
-            ContextMenuStrip = new ContextMenuStrip(),
+            ContextMenuStrip = _contextMenu,
             Icon = _enabledIcon,
             Text = "单指触摸转鼠标：正在启动",
             Visible = true,
         };
-        _trayIcon.ContextMenuStrip.Items.Add(_statusItem);
-        _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-        _trayIcon.ContextMenuStrip.Items.Add(exitItem);
         _trayIcon.MouseClick += OnTrayIconMouseClick;
 
-        EnableService(showNotification: false);
+        try
+        {
+            _inputHost = new InputThreadHost(OnInputDiagnostic, mouseInput);
+        }
+        catch
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.ContextMenuStrip = null;
+            _trayIcon.Dispose();
+            _contextMenu.Dispose();
+            _enabledIcon.Dispose();
+            throw;
+        }
+
+        RuntimeLog.WriteAsync(
+            $"触摸转鼠标功能已开启；输入线程={_inputHost.ManagedThreadId}，" +
+            $"托盘线程={Environment.CurrentManagedThreadId}。");
+        UpdateTrayState(isEnabled: true);
     }
+
+    internal void PerformExitMenuClickForTesting() => _exitItem.PerformClick();
+
+    internal void ShowContextMenuForTesting()
+    {
+        MethodInfo showContextMenu = typeof(NotifyIcon).GetMethod(
+            "ShowContextMenu",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(
+                typeof(NotifyIcon).FullName,
+                "ShowContextMenu");
+        _ = showContextMenu.Invoke(_trayIcon, null);
+    }
+
+    internal bool IsContextMenuVisibleForTesting => _contextMenu.Visible;
+
+    internal bool InputStoppedCleanlyForTesting =>
+        _inputHost.StoppedCleanly && _inputHost.MessageWindowHandle == nint.Zero;
 
     private void OnTrayIconMouseClick(object? sender, MouseEventArgs args)
     {
@@ -50,50 +96,34 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
 
         long now = Environment.TickCount64;
-        if (_exitRequested ||
+        if (Volatile.Read(ref _exitRequested) != 0 ||
             _pendingAction != PendingAction.None ||
             now < _ignoreTrayClicksUntil)
         {
             return;
         }
 
-        // A touch-generated SendInput click can still be inside the hook/window callback stack
-        // while NotifyIcon raises MouseClick. Never install or remove hooks from this callback.
+        // Coalesce the duplicate notifications that Explorer can emit for an injected tray click.
+        // The actual input transition is only a PostMessage to the dedicated input thread.
         _ignoreTrayClicksUntil = now + SystemInformation.DoubleClickTime;
         ScheduleDeferredAction(PendingAction.Toggle, delayMilliseconds: 75);
     }
 
     private void ExecuteToggle()
     {
-        if (_service is null)
-            EnableService(showNotification: true);
-        else
-            DisableService(showNotification: true);
-    }
+        bool nextState = !_isEnabled;
+        if (!_inputHost.TrySetEnabled(nextState))
+        {
+            RuntimeLog.WriteAsync("无法切换输入线程状态；保持当前托盘状态。");
+            return;
+        }
 
-    private void EnableService(bool showNotification)
-    {
-        var service = new GlobalTouchMouseService(_messageWindow.Handle);
-        service.DiagnosticMessage += OnServiceDiagnostic;
-        _service = service;
-        RuntimeLog.WriteAsync("触摸转鼠标功能已开启。");
-        UpdateTrayState(isEnabled: true);
-        if (showNotification)
-            ShowStateNotification("功能已开启");
-    }
-
-    private void DisableService(bool showNotification)
-    {
-        var service = _service;
-        _service = null;
-        service?.StopAcceptingInput();
-        if (service is not null)
-            service.DiagnosticMessage -= OnServiceDiagnostic;
-        service?.Dispose();
-        RuntimeLog.WriteAsync("触摸转鼠标功能已关闭。");
-        UpdateTrayState(isEnabled: false);
-        if (showNotification)
-            ShowStateNotification("功能已关闭");
+        _isEnabled = nextState;
+        RuntimeLog.WriteAsync(nextState
+            ? "触摸转鼠标功能已开启。"
+            : "触摸转鼠标功能已关闭。");
+        UpdateTrayState(nextState);
+        ShowStateNotification(nextState ? "功能已开启" : "功能已关闭");
     }
 
     private void UpdateTrayState(bool isEnabled)
@@ -112,66 +142,20 @@ internal sealed class TrayApplicationContext : ApplicationContext
             message,
             ToolTipIcon.Info);
 
-    private static void OnServiceDiagnostic(string message) => RuntimeLog.WriteAsync(message);
+    private static void OnInputDiagnostic(string message) => RuntimeLog.WriteAsync(message);
 
     private void RequestExit()
     {
-        if (_exitRequested)
+        if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
             return;
 
-        _exitRequested = true;
-        CancelDeferredAction();
-
-        // A ToolStripDropDown owns a nested message loop. A WinForms timer can therefore tick
-        // before the menu callback and its mouse capture have actually unwound. Do only the
-        // lock-free fail-open write here; release buttons and terminate from ThreadPool timers.
-        RuntimeLog.WriteAsync("收到退出请求；输入处理已立即停止拦截，等待安全退出。");
-        _service?.StopAcceptingInput();
-
-        _exitWorker = new System.Threading.Timer(
-            _ => CompleteExitOffUiThread(),
-            null,
-            TimeSpan.FromMilliseconds(200),
-            Timeout.InfiniteTimeSpan);
-
-        // If SendInput or the CLR exit path ever blocks, force process termination. Windows then
-        // removes the low-level hook and releases any window/menu capture owned by this process.
-        _exitWatchdog = new System.Threading.Timer(
-            _ => ForceTerminateProcess(),
-            null,
-            TimeSpan.FromSeconds(3),
-            Timeout.InfiniteTimeSpan);
-    }
-
-    private void CompleteExitOffUiThread()
-    {
-        try
-        {
-            // Do not uninstall the hook or destroy its message window here. Stopping interception
-            // plus an explicit button release is enough; process termination removes the hook
-            // atomically without re-entering WinForms' tray-menu cleanup.
-            _service?.EnterFailOpenMode();
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            RuntimeLog.WriteAsync($"退出前释放鼠标按键失败：{ex}");
-        }
-        finally
-        {
-            Environment.Exit(0);
-        }
-    }
-
-    private static void ForceTerminateProcess()
-    {
-        try
-        {
-            Process.GetCurrentProcess().Kill(entireProcessTree: false);
-        }
-        catch
-        {
-            Environment.FailFast("StillTouch exit watchdog timed out.");
-        }
+        // The callback performs no SendInput, unhook, wait, timer disposal, or window teardown.
+        // WinForms closes the menu before this Click callback and disposes this context only after
+        // the application message loop has returned.
+        _shutdownWatchdog.Arm();
+        _inputHost.RequestStop();
+        RuntimeLog.WriteAsync("收到退出请求；已停止拦截并请求输入线程有序退出。");
+        ExitThread();
     }
 
     private void ScheduleDeferredAction(PendingAction action, int delayMilliseconds)
@@ -191,12 +175,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         PendingAction action = _pendingAction;
         CancelDeferredAction();
 
-        switch (action)
-        {
-            case PendingAction.Toggle when !_exitRequested:
-                ExecuteToggle();
-                break;
-        }
+        if (action == PendingAction.Toggle && Volatile.Read(ref _exitRequested) == 0)
+            ExecuteToggle();
     }
 
     private void CancelDeferredAction()
@@ -214,34 +194,48 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (!disposing)
         {
-            CancelDeferredAction();
-
-            _exitWorker?.Dispose();
-            _exitWorker = null;
-
-            _exitWatchdog?.Dispose();
-            _exitWatchdog = null;
-
-            var service = _service;
-            _service = null;
-            service?.StopAcceptingInput();
-            if (service is not null)
-                service.DiagnosticMessage -= OnServiceDiagnostic;
-            service?.Dispose();
-            RuntimeLog.WriteAsync("StillTouch 已退出。");
-
-            _trayIcon.Visible = false;
-            var contextMenu = _trayIcon.ContextMenuStrip;
-            _trayIcon.ContextMenuStrip = null;
-            _trayIcon.Dispose();
-            contextMenu?.Dispose();
-            _enabledIcon.Dispose();
-            _messageWindow.Dispose();
+            base.Dispose(disposing);
+            return;
         }
 
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            base.Dispose(disposing);
+            return;
+        }
+
+        // Covers teardown paths other than the explicit Exit item as well. Arm is idempotent.
+        _shutdownWatchdog.Arm();
+        TryCleanup(CancelDeferredAction, "取消托盘延迟操作");
+
+        TryCleanup(() =>
+        {
+            _trayIcon.MouseClick -= OnTrayIconMouseClick;
+            _trayIcon.Visible = false;
+            _trayIcon.ContextMenuStrip = null;
+        }, "隐藏托盘图标");
+
+        TryCleanup(_inputHost.Dispose, "停止输入线程");
+        TryCleanup(_trayIcon.Dispose, "销毁托盘图标");
+        TryCleanup(_contextMenu.Dispose, "销毁托盘菜单");
+        TryCleanup(_enabledIcon.Dispose, "销毁应用图标");
+
+        _ = RuntimeLog.Write("StillTouch 输入线程和托盘资源已完成退出清理。");
         base.Dispose(disposing);
+    }
+
+    private static void TryCleanup(Action cleanup, string stage)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            RuntimeLog.WriteAsync($"退出清理“{stage}”失败：{ex}");
+        }
     }
 
     private static Icon LoadAppIcon()
@@ -251,22 +245,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ?? throw new InvalidOperationException("Embedded application icon was not found.");
         using var icon = new Icon(stream);
         return new Icon(icon, icon.Size);
-    }
-
-    private sealed class MessageWindow : NativeWindow, IDisposable
-    {
-        private static readonly nint MessageOnlyWindow = new(-3);
-
-        public MessageWindow()
-        {
-            CreateHandle(new CreateParams
-            {
-                Caption = "StillTouch Message Window",
-                Parent = MessageOnlyWindow,
-            });
-        }
-
-        public void Dispose() => DestroyHandle();
     }
 
     private enum PendingAction

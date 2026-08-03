@@ -6,7 +6,7 @@ StillTouch 是一个 Windows 全局单指触摸转鼠标工具。只有确认属
 
 ## 下载与使用
 
-从 [GitHub Releases](https://github.com/Zephyr333/StillTouch/releases/latest) 下载 `StillTouch.exe`。这是 Windows x64 自包含单文件程序，不需要安装 .NET，也不需要把 DLL 或配置文件放在旁边。
+从 [GitHub Releases](https://github.com/Zephyr333/StillTouch/releases/latest) 下载 `StillTouch.exe`。这是适用于 Windows 10 build 19041 或更高版本的 x64 自包含单文件程序，不需要安装 .NET，也不需要把 DLL 或配置文件放在旁边。
 
 1. 双击 `StillTouch.exe`，确认管理员权限提示。
 2. 功能默认开启，程序常驻系统托盘。
@@ -42,7 +42,7 @@ dotnet publish .\StillTouch\StillTouch.csproj -c Release -r win-x64 --self-conta
 dotnet run --project .\StillTouch.Tests\StillTouch.Tests.csproj -c Release
 ```
 
-自动测试覆盖轻点、主动长按、拖动取消、多指取消、同位置连续轻点、原始触摸与兼容鼠标去重、笔/鼠标识别、虚拟桌面负坐标、异常释放和原生窗口过程转发。
+自动测试覆盖轻点、主动长按、拖动取消与抬键、多指取消、同位置连续轻点、原始触摸与兼容鼠标去重、笔/鼠标识别、虚拟桌面负坐标、部分 `SendInput`、专用 Hook 消息线程、实际展开的 WinForms 托盘菜单退出、独立看门狗、原生进程终止和紧急抬键阻塞。
 
 建议在目标触摸设备上人工验证：桌面与窗口客户区轻点、不会自行响应触摸长按的软件、同位置快速双击、超过阈值的拖动、双指滚动/缩放、手写笔和真实鼠标。
 
@@ -52,7 +52,7 @@ dotnet run --project .\StillTouch.Tests\StillTouch.Tests.csproj -c Release
 - Windows 登录界面、锁屏、UAC 安全桌面以及高于本程序完整性级别的进程无法操作。`SendInput` 受 Windows UIPI 约束，只允许向同级或更低完整性级别注入输入。
 - 某些反作弊、反注入或独占输入程序会主动忽略 `SendInput`，便携式用户态工具无法保证绕过这些策略。
 - Windows 没有供普通用户态程序安全使用的“全局屏蔽所有原始触摸”Hook。StillTouch 会屏蔽触摸派生的兼容鼠标点击，但完全自行消费 `WM_POINTER`/Raw Input 的触摸优先程序仍可能同时收到原始触摸。
-- 程序退出时先停用触摸监视并卸载鼠标 Hook，再释放托盘资源；若系统输入序列已经被第三方驱动或程序破坏，仍建议先用键盘结束相关程序。
+- 程序退出时先原子地阻止新的合成按键、停用触摸监视并卸载鼠标 Hook；若正常清理失败或超时，只按程序已确认持有或正在注入的按键快照做有界紧急抬键，随后由独立看门狗结束进程。Windows 不提供带“注入进程所有权”的鼠标状态，因此真实鼠标恰好同时按住同一键时，任何兜底抬键都无法做到绝对区分。
 
 ## 许可证与致谢
 

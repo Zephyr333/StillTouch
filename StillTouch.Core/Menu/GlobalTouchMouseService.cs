@@ -17,8 +17,10 @@ public sealed class GlobalTouchMouseService : IDisposable
     private const uint WM_RBUTTONDOWN = 0x0204;
     private const uint WM_RBUTTONUP = 0x0205;
     private readonly nint _messageWindowHandle;
+    private readonly int _ownerThreadId;
     private readonly HOOKPROC _hookProc;
     private readonly GestureRecognitionService _touchMonitor;
+    private readonly AbsoluteMouseInput _mouseInput;
     private readonly TouchMouseStateMachine _mouseState = new();
     private readonly RawTouchClickStateMachine _rawTouchState = new();
     private readonly PromotedMouseSuppressionState _promotedMouseSuppression = new();
@@ -30,10 +32,19 @@ public sealed class GlobalTouchMouseService : IDisposable
     public event Action<string>? DiagnosticMessage;
 
     public GlobalTouchMouseService(nint messageWindowHandle)
+        : this(messageWindowHandle, new AbsoluteMouseInput())
+    {
+    }
+
+    internal GlobalTouchMouseService(
+        nint messageWindowHandle,
+        AbsoluteMouseInput mouseInput)
     {
         if (messageWindowHandle == nint.Zero)
             throw new ArgumentException("A message window handle is required.", nameof(messageWindowHandle));
 
+        _mouseInput = mouseInput ?? throw new ArgumentNullException(nameof(mouseInput));
+        _ownerThreadId = Environment.CurrentManagedThreadId;
         _messageWindowHandle = messageWindowHandle;
         _touchMonitor = new GestureRecognitionService(messageWindowHandle);
         _touchMonitor.TouchContactChanged += OnTouchContactChanged;
@@ -57,8 +68,7 @@ public sealed class GlobalTouchMouseService : IDisposable
             if (_hook.IsInvalid)
                 throw new Win32Exception();
 
-            _acceptingInput = true;
-            _touchMonitor.IsEnabled = true;
+            SetEnabled(true);
         }
         catch
         {
@@ -75,22 +85,23 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     public void Dispose()
     {
+        EnsureOwnerThread();
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
             return;
 
-        EnterFailOpenMode();
+        StopAcceptingInput();
+        CancelLongPressTimer();
         _touchMonitor.TouchContactChanged -= OnTouchContactChanged;
         _touchMonitor.LongPressTimerElapsed -= OnLongPressTimerElapsed;
         _touchMonitor.DiagnosticMessage -= ReportDiagnostic;
 
-        // Stop the hook before the final button release. Hook callbacks always forward with a null
-        // handle, so disposing the SafeHandle cannot race CallNextHookEx during shutdown.
+        // No input callback can run concurrently because disposal is confined to the hook-owning
+        // message thread. Unhook before the final owned-button release so shutdown injection cannot
+        // re-enter this service.
         _hook?.Dispose();
         _hook = null;
-        _ = AbsoluteMouseInput.ReleaseButtons();
-        _mouseState.Reset();
-        _rawTouchState.Reset();
-        _promotedMouseSuppression.Clear();
+        ReleaseOwnedButtonsWithDiagnostics("退出时释放合成鼠标按键失败");
+        ResetInputState();
 
         _longPressTimer.Dispose();
         _touchMonitor.Dispose();
@@ -100,10 +111,40 @@ public sealed class GlobalTouchMouseService : IDisposable
     {
         StopAcceptingInput();
         CancelLongPressTimer();
+    }
 
-        // A partially replayed drag must never survive disabling or process shutdown. Releasing
-        // both buttons is idempotent and also recovers from a partial SendInput sequence.
-        _ = AbsoluteMouseInput.ReleaseButtons();
+    /// <summary>
+    /// Enables or disables conversion on the thread that owns the message window and low-level
+    /// hook. Disabling releases only synthetic buttons owned by this service. Final disposal still
+    /// unhooks before retrying any outstanding release.
+    /// </summary>
+    public void SetEnabled(bool enabled)
+    {
+        EnsureOwnerThread();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeStarted) != 0, this);
+
+        if (enabled)
+        {
+            if (_acceptingInput)
+                return;
+
+            if (!ReleaseOwnedButtonsWithDiagnostics(
+                    "重新开启功能前释放残留合成鼠标按键失败"))
+            {
+                return;
+            }
+
+            ResetInputState();
+            _touchMonitor.IsEnabled = true;
+            _acceptingInput = true;
+            return;
+        }
+
+        StopAcceptingInput();
+        CancelLongPressTimer();
+        _touchMonitor.IsEnabled = false;
+        ReleaseOwnedButtonsWithDiagnostics("关闭功能时释放合成鼠标按键失败");
+        ResetInputState();
     }
 
     /// <summary>
@@ -111,6 +152,8 @@ public sealed class GlobalTouchMouseService : IDisposable
     /// inside a tray or input callback; full disposal must happen after that callback unwinds.
     /// </summary>
     public void StopAcceptingInput() => _acceptingInput = false;
+
+    internal bool IsEnabled => _acceptingInput;
 
     private LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
     {
@@ -248,7 +291,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (decision.Action == RawTouchClickAction.None || !_acceptingInput)
             return;
 
-        bool succeeded = AbsoluteMouseInput.Click(
+        bool succeeded = _mouseInput.Click(
             decision.Position,
             rightButton: decision.Action == RawTouchClickAction.RightClick);
         if (succeeded)
@@ -261,7 +304,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         else
         {
             int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
+            _ = _mouseInput.ReleaseOwnedButtons();
             _rawTouchState.MarkInjectionFailed(decision.Sequence);
             Debug.WriteLine(
                 $"SendInput failed for raw {decision.Action}; Win32 error {error}.");
@@ -273,10 +316,10 @@ public sealed class GlobalTouchMouseService : IDisposable
     private void ReleaseReplayedDragIfNeeded()
     {
         if (_mouseState.TryEndReplayedDrag(out var point) &&
-            !AbsoluteMouseInput.ReleaseLeft(point))
+            !_mouseInput.ReleaseLeft(point))
         {
             int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
+            _ = _mouseInput.ReleaseOwnedButtons();
             Debug.WriteLine($"Failed to release replayed left drag; Win32 error {error}.");
             ReportDiagnostic($"释放拖动左键失败，Win32 错误 {error}。");
         }
@@ -290,18 +333,18 @@ public sealed class GlobalTouchMouseService : IDisposable
         bool succeeded = decision.Action switch
         {
             TouchMouseAction.None => true,
-            TouchMouseAction.LeftClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: false),
-            TouchMouseAction.RightClick => AbsoluteMouseInput.Click(decision.EndPoint, rightButton: true),
-            TouchMouseAction.BeginLeftDrag => AbsoluteMouseInput.BeginLeftDrag(decision.StartPoint, decision.EndPoint),
-            TouchMouseAction.EndLeftDrag => AbsoluteMouseInput.ReleaseLeft(decision.EndPoint),
-            TouchMouseAction.CompleteLeftDrag => AbsoluteMouseInput.CompleteLeftDrag(decision.StartPoint, decision.EndPoint),
+            TouchMouseAction.LeftClick => _mouseInput.Click(decision.EndPoint, rightButton: false),
+            TouchMouseAction.RightClick => _mouseInput.Click(decision.EndPoint, rightButton: true),
+            TouchMouseAction.BeginLeftDrag => _mouseInput.BeginLeftDrag(decision.StartPoint, decision.EndPoint),
+            TouchMouseAction.EndLeftDrag => _mouseInput.ReleaseLeft(decision.EndPoint),
+            TouchMouseAction.CompleteLeftDrag => _mouseInput.CompleteLeftDrag(decision.StartPoint, decision.EndPoint),
             _ => true,
         };
 
         if (!succeeded)
         {
             int error = Marshal.GetLastPInvokeError();
-            _ = AbsoluteMouseInput.ReleaseButtons();
+            _ = _mouseInput.ReleaseOwnedButtons();
             Debug.WriteLine($"SendInput failed for {decision.Action}; Win32 error {error}.");
             ReportDiagnostic(
                 $"兼容触摸转换 {decision.Action} 的 SendInput 失败，Win32 错误 {error}。");
@@ -311,6 +354,33 @@ public sealed class GlobalTouchMouseService : IDisposable
     private void ClearRawSuppression()
     {
         _promotedMouseSuppression.Clear();
+    }
+
+    private bool ReleaseOwnedButtonsWithDiagnostics(string message)
+    {
+        if (_mouseInput.ReleaseOwnedButtons())
+            return true;
+
+        int error = Marshal.GetLastPInvokeError();
+        Debug.WriteLine($"{message}; Win32 error {error}.");
+        ReportDiagnostic($"{message}，Win32 错误 {error}。");
+        return false;
+    }
+
+    private void ResetInputState()
+    {
+        _mouseState.Reset();
+        _rawTouchState.Reset();
+        _promotedMouseSuppression.Clear();
+    }
+
+    private void EnsureOwnerThread()
+    {
+        if (Environment.CurrentManagedThreadId != _ownerThreadId)
+        {
+            throw new InvalidOperationException(
+                "GlobalTouchMouseService must be enabled, disabled, and disposed on its owning input thread.");
+        }
     }
 
     private void ReportDiagnostic(string message)

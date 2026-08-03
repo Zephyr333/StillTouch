@@ -13,6 +13,17 @@ internal sealed class RawContactLifecycleTracker
 
     public int ActiveContactCount => _active.Count;
 
+    public bool HasActiveContacts(nint deviceHandle)
+    {
+        foreach (ContactKey key in _active.Keys)
+        {
+            if (key.DeviceHandle == deviceHandle)
+                return true;
+        }
+
+        return false;
+    }
+
     public TouchContactSnapshot ProcessFrame(
         nint deviceHandle,
         long frameEpoch,

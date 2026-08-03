@@ -64,6 +64,29 @@ internal sealed class RawTouchStreamHealthTracker
         return state.StreamEpoch;
     }
 
+    /// <summary>
+    /// A zero-contact report with no pending hybrid frame is a safe stream boundary, not evidence
+    /// of a missing contact by itself. It must never poison an otherwise healthy stream. When a
+    /// previous real gap left the device quarantined, the empty boundary proves that no old tip
+    /// contact can leak into the next physical Down and starts a fresh healthy epoch.
+    /// </summary>
+    public RawTouchStreamDecision ObserveZeroContactBoundary(nint deviceHandle)
+    {
+        DeviceHealth state = GetOrCreate(deviceHandle);
+        if (!state.IsQuarantined)
+        {
+            return new(
+                RawTouchStreamDisposition.Accepted,
+                state.StreamEpoch);
+        }
+
+        state.IsQuarantined = false;
+        state.StreamEpoch = NextEpoch();
+        return new(
+            RawTouchStreamDisposition.Resynchronized,
+            state.StreamEpoch);
+    }
+
     public bool IsHealthy(nint deviceHandle) =>
         _devices.TryGetValue(deviceHandle, out DeviceHealth? state) &&
         !state.IsQuarantined;

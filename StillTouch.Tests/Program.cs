@@ -115,6 +115,8 @@ var tests = new (string Name, Action Run)[]
     ("raw replacement exposes discontinuity", RawReplacementExposesDiscontinuity),
     ("raw stream gap quarantines until lifted", RawStreamGapQuarantinesUntilLifted),
     ("raw stream health is isolated per device", RawStreamHealthIsIsolatedPerDevice),
+    ("raw zero tail preserves consecutive taps", RawZeroTailPreservesConsecutiveTaps),
+    ("raw zero-only lift recovers next tap", RawZeroOnlyLiftRecoversNextTap),
     ("raw duplicate contact frame is atomic", RawDuplicateContactFrameIsAtomic),
     ("raw replacement frame order cannot click", RawReplacementFrameOrderCannotClick),
     ("raw contact ids are scoped and reused safely", RawContactIdsAreScopedAndReusedSafely),
@@ -778,6 +780,107 @@ static void RawStreamHealthIsIsolatedPerDevice()
     Assert(reattached.Disposition == RawTouchStreamDisposition.Accepted &&
         reattached.StreamEpoch > secondNext.StreamEpoch,
         "a reattached handle must receive a new process-lifetime stream epoch");
+}
+
+static void RawZeroTailPreservesConsecutiveTaps()
+{
+    var pipeline = new RawPipelineHarness();
+    nint device = new(0x351);
+    var point = new Point(350, 350);
+
+    const int TapCount = 20;
+    for (int tap = 0; tap < TapCount; tap++)
+    {
+        uint downScan = (uint)(3500 + tap * 3);
+        Assert(pipeline.Report(
+            device,
+            contactCount: 1,
+            hasScanTime: true,
+            scanTime: downScan,
+            [new RawDecodedContact(5, true, point)]) ==
+            RawTouchFrameStatus.Completed,
+            $"tap {tap + 1}: raw Down did not complete");
+        Assert(pipeline.Report(
+            device,
+            contactCount: 1,
+            hasScanTime: true,
+            scanTime: downScan + 1,
+            [new RawDecodedContact(5, false, point)]) ==
+            RawTouchFrameStatus.Completed,
+            $"tap {tap + 1}: raw Up did not complete");
+        Assert(pipeline.Report(
+            device,
+            contactCount: 0,
+            hasScanTime: true,
+            scanTime: downScan + 2,
+            ReadOnlySpan<RawDecodedContact>.Empty) ==
+            RawTouchFrameStatus.OrphanContinuation,
+            $"tap {tap + 1}: expected a zero-contact tail report");
+
+        Assert(pipeline.Clicks.Count == tap + 1,
+            $"tap {tap + 1}: the zero tail poisoned a later click sequence");
+        Assert(pipeline.IsHealthy(device) &&
+            pipeline.ActiveContactCount == 0 &&
+            !pipeline.HasConvertibleCandidate,
+            $"tap {tap + 1}: the complete tap did not return every layer to idle");
+    }
+
+    Assert(pipeline.Clicks.Select(click => click.Sequence)
+        .SequenceEqual(Enumerable.Range(1, TapCount).Select(value => (long)value)),
+        "consecutive taps did not retain independent monotonic click sequences");
+}
+
+static void RawZeroOnlyLiftRecoversNextTap()
+{
+    var pipeline = new RawPipelineHarness();
+    nint device = new(0x361);
+    var point = new Point(360, 360);
+
+    _ = pipeline.Report(
+        device,
+        1,
+        true,
+        3600,
+        [new RawDecodedContact(9, true, point)]);
+    Assert(pipeline.HasConvertibleCandidate && pipeline.ActiveContactCount == 1,
+        "the zero-only-lift recovery setup did not create an active candidate");
+
+    _ = pipeline.Report(
+        device,
+        0,
+        true,
+        3601,
+        ReadOnlySpan<RawDecodedContact>.Empty);
+    Assert(pipeline.Clicks.Count == 0 &&
+        pipeline.IsHealthy(device) &&
+        pipeline.ActiveContactCount == 0 &&
+        !pipeline.HasConvertibleCandidate,
+        "an ambiguous zero-only lift must cancel fail-open without poisoning the stream");
+
+    _ = pipeline.Report(
+        device,
+        1,
+        true,
+        3602,
+        [new RawDecodedContact(9, true, point)]);
+    _ = pipeline.Report(
+        device,
+        1,
+        true,
+        3603,
+        [new RawDecodedContact(9, false, point)]);
+    Assert(pipeline.Clicks.Count == 1 && pipeline.IsHealthy(device),
+        "the physical tap after a zero-only lift did not recover without toggle/restart");
+
+    _ = pipeline.Health.MarkDiscontinuity(device);
+    _ = pipeline.Report(
+        device,
+        0,
+        true,
+        3604,
+        ReadOnlySpan<RawDecodedContact>.Empty);
+    Assert(pipeline.IsHealthy(device),
+        "a zero-contact boundary must release an already quarantined idle stream");
 }
 
 static void RawDuplicateContactFrameIsAtomic()
@@ -1925,3 +2028,94 @@ static void Assert(bool condition, string message)
 
 [UnmanagedFunctionPointer(CallingConvention.Winapi)]
 delegate nint ForeignWindowProcedure(nint hWnd, uint message, nuint wParam, nint lParam);
+
+sealed class RawPipelineHarness
+{
+    private readonly RawTouchFrameAssembler _assembler = new();
+    private readonly RawContactLifecycleTracker _lifecycles = new();
+    private readonly RawTouchClickStateMachine _clickState = new();
+    private readonly List<TouchContactChange> _changes = new();
+    private long _timestamp = 10_000;
+
+    public RawTouchStreamHealthTracker Health { get; } = new();
+
+    public List<RawTouchClickDecision> Clicks { get; } = new();
+
+    public int ActiveContactCount => _lifecycles.ActiveContactCount;
+
+    public bool HasConvertibleCandidate => _clickState.HasConvertibleCandidate;
+
+    public bool IsHealthy(nint deviceHandle) => Health.IsHealthy(deviceHandle);
+
+    public RawTouchFrameStatus Report(
+        nint deviceHandle,
+        int contactCount,
+        bool hasScanTime,
+        uint scanTime,
+        ReadOnlySpan<RawDecodedContact> contacts)
+    {
+        RawTouchFrameResult result = _assembler.AppendReport(
+            deviceHandle,
+            hasContactCount: true,
+            contactCount,
+            hasScanTime,
+            scanTime,
+            contacts);
+
+        if (result.Status == RawTouchFrameStatus.Pending)
+            return result.Status;
+
+        if (result.Status == RawTouchFrameStatus.OrphanContinuation)
+        {
+            if (_lifecycles.HasActiveContacts(deviceHandle))
+            {
+                _lifecycles.ResetDevice(deviceHandle);
+                _clickState.Reset();
+            }
+
+            _ = Health.ObserveZeroContactBoundary(deviceHandle);
+            return result.Status;
+        }
+
+        if (result.Status != RawTouchFrameStatus.Completed ||
+            result.Contacts is not { } completedContacts)
+        {
+            _ = Health.MarkDiscontinuity(deviceHandle);
+            _assembler.ResetDevice(deviceHandle);
+            _lifecycles.ResetDevice(deviceHandle);
+            _clickState.Reset();
+            return result.Status;
+        }
+
+        if (result.HadDiscontinuity)
+        {
+            _ = Health.MarkDiscontinuity(deviceHandle);
+            _assembler.ResetDevice(deviceHandle);
+            _lifecycles.ResetDevice(deviceHandle);
+            _clickState.Reset();
+        }
+
+        RawTouchStreamDecision stream =
+            Health.ObserveCompletedFrame(deviceHandle, completedContacts);
+        if (stream.Disposition != RawTouchStreamDisposition.Accepted)
+            return result.Status;
+
+        _timestamp += 10;
+        _ = _lifecycles.ProcessFrame(
+            deviceHandle,
+            result.FrameEpoch,
+            result.ScanTime,
+            completedContacts,
+            _timestamp,
+            _changes,
+            stream.StreamEpoch);
+        for (int index = 0; index < _changes.Count; index++)
+        {
+            RawTouchClickDecision decision = _clickState.Process(_changes[index], 12);
+            if (decision.Action != RawTouchClickAction.None)
+                Clicks.Add(decision);
+        }
+
+        return result.Status;
+    }
+}

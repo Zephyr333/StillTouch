@@ -459,6 +459,34 @@ public sealed class GestureRecognitionService : IDisposable
         if (result.Status == RawTouchFrameStatus.Pending)
             return;
 
+        if (result.Status == RawTouchFrameStatus.OrphanContinuation)
+        {
+            // MateBook-class devices may append a zero-contact idle/tail report after a fully
+            // completed lift frame. With no pending hybrid frame it must not be promoted to a
+            // permanent parser gap. If a driver uses this as the only observable lift boundary,
+            // cancel the unfinished candidate fail-open (no click) and let the next Down start a
+            // clean lifecycle instead of requiring a restart/toggle.
+            bool canceledActiveContact =
+                _rawLifecycles.HasActiveContacts(deviceHandle);
+            if (canceledActiveContact)
+            {
+                _rawLifecycles.ResetDevice(deviceHandle);
+                _rawChanges.Clear();
+                PublishTouchReset();
+            }
+
+            RawTouchStreamDecision boundary =
+                _rawStreamHealth.ObserveZeroContactBoundary(deviceHandle);
+            _trace.Record(new(
+                Environment.TickCount64,
+                InputTraceKind.RawStream,
+                DeviceHandle: deviceHandle,
+                StreamEpoch: boundary.StreamEpoch,
+                Code: (int)boundary.Disposition,
+                Result: canceledActiveContact ? 4 : 3));
+            return;
+        }
+
         if (result.Status != RawTouchFrameStatus.Completed ||
             result.Contacts is not { } completedContacts)
         {

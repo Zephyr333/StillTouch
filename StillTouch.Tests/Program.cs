@@ -1,14 +1,7 @@
-using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using StillTouch.Core;
 using Windows.Win32;
-
-if (args is ["--hard-exit-probe"])
-{
-    CurrentProcessTermination.Terminate();
-    return 99;
-}
 
 var tests = new (string Name, Action Run)[]
 {
@@ -31,9 +24,6 @@ var tests = new (string Name, Action Run)[]
     ("same-position rapid taps stay independent", SamePositionRapidTapsStayIndependent),
     ("next promoted down escapes stale suppression", NextPromotedDownEscapesStaleSuppression),
     ("drag up escapes raw suppression", DragUpEscapesRawSuppression),
-    ("exit worker releases before termination", ExitWorkerReleasesBeforeTermination),
-    ("exit watchdog survives blocked release", ExitWatchdogSurvivesBlockedRelease),
-    ("native hard exit terminates child process", NativeHardExitTerminatesChildProcess),
     ("native fallback cannot duplicate raw click", NativeFallbackCannotDuplicateRawClick),
     ("raw reset cancels pending input", RawResetCancelsPendingInput),
 };
@@ -251,76 +241,6 @@ static void DragUpEscapesRawSuppression()
 
     Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 9, 6050, true),
         "raw click suppression must never swallow the up for an injected drag down");
-}
-
-static void ExitWorkerReleasesBeforeTermination()
-{
-    using var terminated = new ManualResetEventSlim();
-    int sequence = 0;
-    int releaseOrder = 0;
-    int terminationOrder = 0;
-    using var coordinator = new FailSafeExitCoordinator(
-        releaseInput: () => releaseOrder = Interlocked.Increment(ref sequence),
-        terminateProcess: () =>
-        {
-            terminationOrder = Interlocked.Increment(ref sequence);
-            terminated.Set();
-        },
-        releaseDelayMilliseconds: 1,
-        watchdogDelayMilliseconds: 1000);
-
-    Assert(coordinator.RequestExit(), "the first exit request must start the workers");
-    Assert(!coordinator.RequestExit(), "duplicate exit requests must be ignored");
-    Assert(terminated.Wait(2000), "the exit worker did not terminate in time");
-    Assert(releaseOrder == 1 && terminationOrder == 2,
-        "input must be released before direct process termination");
-}
-
-static void ExitWatchdogSurvivesBlockedRelease()
-{
-    using var releaseGate = new ManualResetEventSlim();
-    using var terminated = new ManualResetEventSlim();
-    using var coordinator = new FailSafeExitCoordinator(
-        releaseInput: () => releaseGate.Wait(),
-        terminateProcess: terminated.Set,
-        releaseDelayMilliseconds: 1,
-        watchdogDelayMilliseconds: 50);
-
-    Assert(coordinator.RequestExit(), "the watchdog test exit request was rejected");
-    Assert(terminated.Wait(1000),
-        "the independent watchdog must terminate even while input release is blocked");
-    releaseGate.Set();
-}
-
-static void NativeHardExitTerminatesChildProcess()
-{
-    string processPath = Environment.ProcessPath
-        ?? throw new InvalidOperationException("The test process path is unavailable.");
-    var startInfo = new ProcessStartInfo
-    {
-        FileName = processPath,
-        UseShellExecute = false,
-        CreateNoWindow = true,
-    };
-
-    if (string.Equals(
-            Path.GetFileNameWithoutExtension(processPath),
-            "dotnet",
-            StringComparison.OrdinalIgnoreCase))
-    {
-        startInfo.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "StillTouch.Tests.dll"));
-    }
-
-    startInfo.ArgumentList.Add("--hard-exit-probe");
-    using var child = Process.Start(startInfo)
-        ?? throw new InvalidOperationException("Failed to start the hard-exit probe.");
-    if (!child.WaitForExit(5000))
-    {
-        child.Kill(entireProcessTree: true);
-        throw new InvalidOperationException("TerminateProcess did not end the probe within five seconds.");
-    }
-
-    Assert(child.ExitCode == 0, $"hard-exit probe returned unexpected code {child.ExitCode}");
 }
 
 static void NativeFallbackCannotDuplicateRawClick()

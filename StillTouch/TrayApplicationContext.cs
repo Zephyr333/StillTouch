@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using System.Diagnostics;
 using StillTouch.Core;
 
 namespace StillTouch;
@@ -10,8 +11,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly Icon _enabledIcon;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
-    private readonly FailSafeExitCoordinator _exitCoordinator;
     private System.Windows.Forms.Timer? _deferredActionTimer;
+    private System.Threading.Timer? _exitWorker;
+    private System.Threading.Timer? _exitWatchdog;
     private GlobalTouchMouseService? _service;
     private PendingAction _pendingAction;
     private bool _exitRequested;
@@ -38,13 +40,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         _trayIcon.ContextMenuStrip.Items.Add(exitItem);
         _trayIcon.MouseClick += OnTrayIconMouseClick;
-
-        // These dedicated threads are created before input conversion starts. They do not depend
-        // on the tray menu's nested message loop, ThreadPool timers, or CLR graceful shutdown.
-        _exitCoordinator = new FailSafeExitCoordinator(
-            releaseInput: ReleaseInputBeforeExit,
-            terminateProcess: () => CurrentProcessTermination.Terminate(),
-            reportDiagnostic: RuntimeLog.WriteAsync);
 
         EnableService(showNotification: false);
     }
@@ -125,15 +120,59 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
 
         _exitRequested = true;
+        CancelDeferredAction();
 
-        // A ToolStripDropDown owns a nested message loop. Do only lock-free state changes and an
-        // event signal here. Dedicated threads perform release and hard process termination.
+        // A ToolStripDropDown owns a nested message loop. A WinForms timer can therefore tick
+        // before the menu callback and its mouse capture have actually unwound. Do only the
+        // lock-free fail-open write here; release buttons and terminate from ThreadPool timers.
         RuntimeLog.WriteAsync("收到退出请求；输入处理已立即停止拦截，等待安全退出。");
         _service?.StopAcceptingInput();
-        _exitCoordinator.RequestExit();
+
+        _exitWorker = new System.Threading.Timer(
+            _ => CompleteExitOffUiThread(),
+            null,
+            TimeSpan.FromMilliseconds(200),
+            Timeout.InfiniteTimeSpan);
+
+        // If SendInput or the CLR exit path ever blocks, force process termination. Windows then
+        // removes the low-level hook and releases any window/menu capture owned by this process.
+        _exitWatchdog = new System.Threading.Timer(
+            _ => ForceTerminateProcess(),
+            null,
+            TimeSpan.FromSeconds(3),
+            Timeout.InfiniteTimeSpan);
     }
 
-    private void ReleaseInputBeforeExit() => _service?.EnterFailOpenMode();
+    private void CompleteExitOffUiThread()
+    {
+        try
+        {
+            // Do not uninstall the hook or destroy its message window here. Stopping interception
+            // plus an explicit button release is enough; process termination removes the hook
+            // atomically without re-entering WinForms' tray-menu cleanup.
+            _service?.EnterFailOpenMode();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            RuntimeLog.WriteAsync($"退出前释放鼠标按键失败：{ex}");
+        }
+        finally
+        {
+            Environment.Exit(0);
+        }
+    }
+
+    private static void ForceTerminateProcess()
+    {
+        try
+        {
+            Process.GetCurrentProcess().Kill(entireProcessTree: false);
+        }
+        catch
+        {
+            Environment.FailFast("StillTouch exit watchdog timed out.");
+        }
+    }
 
     private void ScheduleDeferredAction(PendingAction action, int delayMilliseconds)
     {
@@ -178,7 +217,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             CancelDeferredAction();
-            _exitCoordinator.Dispose();
+
+            _exitWorker?.Dispose();
+            _exitWorker = null;
+
+            _exitWatchdog?.Dispose();
+            _exitWatchdog = null;
 
             var service = _service;
             _service = null;

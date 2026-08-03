@@ -16,7 +16,12 @@ internal readonly record struct TouchContactChange(
     Point Position,
     int ActiveContactCount,
     int MaxContactCount,
-    long TimestampMilliseconds);
+    long TimestampMilliseconds,
+    nint DeviceHandle = default,
+    long FrameEpoch = 0,
+    uint ScanTime = 0,
+    long ContactGeneration = 0,
+    long RawStreamEpoch = 0);
 
 internal enum RawTouchClickAction
 {
@@ -44,6 +49,16 @@ internal sealed class RawTouchClickStateMachine
 
     public int? GetLongPressDelay(long nowMilliseconds)
     {
+        long? deadline = GetLongPressDueMilliseconds();
+        if (deadline is not { } dueMilliseconds)
+            return null;
+
+        long remaining = dueMilliseconds - nowMilliseconds;
+        return (int)Math.Clamp(remaining, 1, int.MaxValue);
+    }
+
+    public long? GetLongPressDueMilliseconds()
+    {
         if (_candidate is not
             {
                 IsCanceled: false,
@@ -54,8 +69,7 @@ internal sealed class RawTouchClickStateMachine
             return null;
         }
 
-        long remaining = candidate.LongPressDueMilliseconds - nowMilliseconds;
-        return (int)Math.Clamp(remaining, 1, int.MaxValue);
+        return candidate.LongPressDueMilliseconds;
     }
 
     public RawTouchClickDecision Process(TouchContactChange change, int movementThresholdPixels)
@@ -72,9 +86,13 @@ internal sealed class RawTouchClickStateMachine
             {
                 _sequence++;
                 _candidate = new Candidate(
+                    change.DeviceHandle,
                     change.ContactId,
+                    change.ContactGeneration,
+                    change.RawStreamEpoch,
                     change.Position,
                     change.TimestampMilliseconds,
+                    movementThresholdPixels,
                     change.ActiveContactCount,
                     change.MaxContactCount);
             }
@@ -91,23 +109,28 @@ internal sealed class RawTouchClickStateMachine
         if (_candidate is not { } candidate)
             return default;
 
-        candidate.ActiveContactCount = change.ActiveContactCount;
         candidate.MaxContactCount = Math.Max(candidate.MaxContactCount, change.MaxContactCount);
 
-        if (change.ContactId == candidate.ContactId)
+        bool matchesCandidate = candidate.Matches(change);
+        if (matchesCandidate)
         {
+            candidate.ActiveContactCount = change.ActiveContactCount;
             candidate.LastPoint = change.Position;
             candidate.IsCanceled |= IsBeyondThreshold(
                 candidate.StartPoint,
                 change.Position,
-                movementThresholdPixels);
+                candidate.MovementThresholdPixels);
         }
 
         if (change.ActiveContactCount > 1 || candidate.MaxContactCount > 1)
             candidate.IsCanceled = true;
 
-        if (change.Kind != TouchContactChangeKind.Up || change.ActiveContactCount != 0)
+        if (change.Kind != TouchContactChangeKind.Up ||
+            change.ActiveContactCount != 0 ||
+            !matchesCandidate)
+        {
             return default;
+        }
 
         _candidate = null;
         if (candidate.IsCanceled || candidate.InjectedAction != RawTouchClickAction.None)
@@ -174,6 +197,12 @@ internal sealed class RawTouchClickStateMachine
             candidate.InjectedAction = RawTouchClickAction.None;
     }
 
+    public void MarkExternallyHandled(long sequence)
+    {
+        if (sequence == _sequence && _candidate is { } candidate)
+            candidate.InjectedAction = RawTouchClickAction.LeftClick;
+    }
+
     public void Reset() => _candidate = null;
 
     private static bool IsBeyondThreshold(Point start, Point current, int threshold)
@@ -185,20 +214,34 @@ internal sealed class RawTouchClickStateMachine
     }
 
     private sealed class Candidate(
+        nint deviceHandle,
         int contactId,
+        long contactGeneration,
+        long rawStreamEpoch,
         Point startPoint,
         long startedAtMilliseconds,
+        int movementThresholdPixels,
         int activeContactCount,
         int maxContactCount)
     {
+        public nint DeviceHandle { get; } = deviceHandle;
         public int ContactId { get; } = contactId;
+        public long ContactGeneration { get; } = contactGeneration;
+        public long RawStreamEpoch { get; } = rawStreamEpoch;
         public Point StartPoint { get; } = startPoint;
         public Point LastPoint { get; set; } = startPoint;
         public long LongPressDueMilliseconds { get; } =
             startedAtMilliseconds + LongPressDurationMilliseconds;
+        public int MovementThresholdPixels { get; } = Math.Max(1, movementThresholdPixels);
         public int ActiveContactCount { get; set; } = activeContactCount;
         public int MaxContactCount { get; set; } = maxContactCount;
         public bool IsCanceled { get; set; }
         public RawTouchClickAction InjectedAction { get; set; }
+
+        public bool Matches(TouchContactChange change) =>
+            DeviceHandle == change.DeviceHandle &&
+            ContactId == change.ContactId &&
+            ContactGeneration == change.ContactGeneration &&
+            RawStreamEpoch == change.RawStreamEpoch;
     }
 }

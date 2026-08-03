@@ -19,6 +19,7 @@ public sealed class GlobalTouchMouseService : IDisposable
     private readonly nint _messageWindowHandle;
     private readonly int _ownerThreadId;
     private readonly HOOKPROC _hookProc;
+    private readonly InputTraceBuffer _trace = new();
     private readonly GestureRecognitionService _touchMonitor;
     private readonly AbsoluteMouseInput _mouseInput;
     private readonly TouchMouseStateMachine _mouseState = new();
@@ -26,6 +27,7 @@ public sealed class GlobalTouchMouseService : IDisposable
     private readonly PromotedMouseSuppressionState _promotedMouseSuppression = new();
     private readonly System.Threading.Timer _longPressTimer;
     private UnhookWindowsHookExSafeHandle? _hook;
+    private long? _scheduledLongPressDueMilliseconds;
     private volatile bool _acceptingInput;
     private int _disposeStarted;
 
@@ -46,7 +48,7 @@ public sealed class GlobalTouchMouseService : IDisposable
         _mouseInput = mouseInput ?? throw new ArgumentNullException(nameof(mouseInput));
         _ownerThreadId = Environment.CurrentManagedThreadId;
         _messageWindowHandle = messageWindowHandle;
-        _touchMonitor = new GestureRecognitionService(messageWindowHandle);
+        _touchMonitor = new GestureRecognitionService(messageWindowHandle, _trace);
         _touchMonitor.TouchContactChanged += OnTouchContactChanged;
         _touchMonitor.LongPressTimerElapsed += OnLongPressTimerElapsed;
         _touchMonitor.DiagnosticMessage += ReportDiagnostic;
@@ -155,21 +157,57 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     internal bool IsEnabled => _acceptingInput;
 
-    private LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
+    internal string CaptureDiagnosticTrace()
     {
+        EnsureOwnerThread();
+        return _trace.FormatSnapshot();
+    }
+
+    private unsafe LRESULT Hook(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        long started = Stopwatch.GetTimestamp();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        int queueDelay = -1;
+        Point tracePoint = default;
         if (nCode < 0 || lParam.Value == 0 || !_acceptingInput)
-            return CallNext(nCode, wParam, lParam);
+        {
+            return CompleteHook(
+                started,
+                allocatedBefore,
+                queueDelay,
+                tracePoint,
+                code: -4,
+                result: 0,
+                suppress: false,
+                nCode,
+                wParam,
+                lParam);
+        }
 
         try
         {
-            var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            MSLLHOOKSTRUCT info = *(MSLLHOOKSTRUCT*)lParam.Value;
+            queueDelay = InputTraceBuffer.GetQueueDelayMilliseconds(info.time);
+            tracePoint = new Point(info.pt.X, info.pt.Y);
             nuint extraInfo = unchecked((nuint)info.dwExtraInfo);
+            bool ownInjection = MouseInputSourceClassifier.IsOwnInjection(extraInfo);
+            bool touchDerived = MouseInputSourceClassifier.IsTouchDerived(extraInfo);
 
-            if (MouseInputSourceClassifier.IsOwnInjection(extraInfo) ||
-                !MouseInputSourceClassifier.IsTouchDerived(extraInfo) ||
+            if (ownInjection ||
+                !touchDerived ||
                 !TryMapMessage((uint)wParam.Value, out var message))
             {
-                return CallNext(nCode, wParam, lParam);
+                return CompleteHook(
+                    started,
+                    allocatedBefore,
+                    queueDelay,
+                    tracePoint,
+                    ownInjection ? -3 : touchDerived ? -1 : -2,
+                    result: 0,
+                    suppress: false,
+                    nCode,
+                    wParam,
+                    lParam);
             }
 
             long now = Environment.TickCount64;
@@ -179,16 +217,28 @@ public sealed class GlobalTouchMouseService : IDisposable
                     now,
                     _mouseState.IsReplayedDrag))
             {
-                return new LRESULT(1);
+                return CompleteHook(
+                    started,
+                    allocatedBefore,
+                    queueDelay,
+                    tracePoint,
+                    (int)message,
+                    result: 0x100,
+                    suppress: true,
+                    nCode,
+                    wParam,
+                    lParam);
             }
 
-            var point = new Point(info.pt.X, info.pt.Y);
+            Point point = tracePoint;
             var decision = _mouseState.Process(
                 message,
                 point,
                 _touchMonitor.CurrentTouchSnapshot,
                 now,
-                GetMovementThreshold(point));
+                message is TouchMouseMessage.LeftDown or TouchMouseMessage.RightDown
+                    ? GetMovementThreshold(point)
+                    : 12);
 
             if (decision.Action is TouchMouseAction.LeftClick or TouchMouseAction.RightClick)
             {
@@ -205,7 +255,17 @@ public sealed class GlobalTouchMouseService : IDisposable
                 ExecuteMouseDecision(decision);
             }
 
-            return decision.Suppress ? new LRESULT(1) : CallNext(nCode, wParam, lParam);
+            return CompleteHook(
+                started,
+                allocatedBefore,
+                queueDelay,
+                tracePoint,
+                (int)message,
+                (int)decision.Action | (decision.Suppress ? 0x100 : 0),
+                decision.Suppress,
+                nCode,
+                wParam,
+                lParam);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -216,8 +276,43 @@ public sealed class GlobalTouchMouseService : IDisposable
             ClearRawSuppression();
             CancelLongPressTimer();
             ReportDiagnostic($"低级鼠标 Hook 处理失败：{ex}");
-            return CallNext(nCode, wParam, lParam);
+            return CompleteHook(
+                started,
+                allocatedBefore,
+                queueDelay,
+                tracePoint,
+                code: -5,
+                result: -1,
+                suppress: false,
+                nCode,
+                wParam,
+                lParam);
         }
+    }
+
+    private LRESULT CompleteHook(
+        long started,
+        long allocatedBefore,
+        int queueDelay,
+        Point point,
+        int code,
+        int result,
+        bool suppress,
+        int nCode,
+        WPARAM wParam,
+        LPARAM lParam)
+    {
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.PromotedMouse,
+            InputTraceBuffer.ElapsedMicroseconds(started),
+            GC.GetAllocatedBytesForCurrentThread() - allocatedBefore,
+            queueDelay,
+            X: point.X,
+            Y: point.Y,
+            Code: code,
+            Result: result));
+        return suppress ? new LRESULT(1) : CallNext(nCode, wParam, lParam);
     }
 
     private void OnTouchContactChanged(TouchContactChange change)
@@ -228,9 +323,9 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (change.Kind is TouchContactChangeKind.Down or TouchContactChangeKind.Reset)
             ClearRawSuppression();
 
-        int threshold = change.Kind == TouchContactChangeKind.Reset
-            ? 12
-            : GetMovementThreshold(change.Position);
+        int threshold = change.Kind == TouchContactChangeKind.Down
+            ? GetMovementThreshold(change.Position)
+            : 12;
         var decision = _rawTouchState.Process(change, threshold);
         ScheduleLongPressTimer(change.TimestampMilliseconds);
         ExecuteRawDecision(decision);
@@ -245,26 +340,46 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (!_acceptingInput)
             return;
 
+        long started = Stopwatch.GetTimestamp();
+        _scheduledLongPressDueMilliseconds = null;
         var decision = _rawTouchState.TryTriggerLongPress(nowMilliseconds);
         ScheduleLongPressTimer(nowMilliseconds);
         ExecuteRawDecision(decision);
+        _trace.Record(new(
+            nowMilliseconds,
+            InputTraceKind.LongPressTimer,
+            InputTraceBuffer.ElapsedMicroseconds(started),
+            Code: (int)decision.Action,
+            Result: decision.Sequence > 0 ? 1 : 0));
     }
 
     private void ScheduleLongPressTimer(long nowMilliseconds)
     {
-        int? delay = _rawTouchState.GetLongPressDelay(nowMilliseconds);
+        long? dueMilliseconds = _rawTouchState.GetLongPressDueMilliseconds();
+        if (dueMilliseconds == _scheduledLongPressDueMilliseconds)
+            return;
+
+        _scheduledLongPressDueMilliseconds = dueMilliseconds;
+        int delay = dueMilliseconds is { } deadline
+            ? (int)Math.Clamp(deadline - nowMilliseconds, 1, int.MaxValue)
+            : Timeout.Infinite;
         try
         {
-            _ = _longPressTimer.Change(delay ?? Timeout.Infinite, Timeout.Infinite);
+            _ = _longPressTimer.Change(delay, Timeout.Infinite);
         }
         catch (ObjectDisposedException)
         {
+            _scheduledLongPressDueMilliseconds = null;
             // Shutdown won the race; no timer message is needed.
         }
     }
 
     private void CancelLongPressTimer()
     {
+        if (_scheduledLongPressDueMilliseconds is null)
+            return;
+
+        _scheduledLongPressDueMilliseconds = null;
         try
         {
             _ = _longPressTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -291,9 +406,22 @@ public sealed class GlobalTouchMouseService : IDisposable
         if (decision.Action == RawTouchClickAction.None || !_acceptingInput)
             return;
 
+        long started = Stopwatch.GetTimestamp();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
         bool succeeded = _mouseInput.Click(
             decision.Position,
             rightButton: decision.Action == RawTouchClickAction.RightClick);
+        int error = succeeded ? 0 : Marshal.GetLastPInvokeError();
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.Injection,
+            InputTraceBuffer.ElapsedMicroseconds(started),
+            GC.GetAllocatedBytesForCurrentThread() - allocatedBefore,
+            X: decision.Position.X,
+            Y: decision.Position.Y,
+            FrameEpoch: decision.Sequence,
+            Code: (int)decision.Action,
+            Result: succeeded ? 1 : -error));
         if (succeeded)
         {
             _promotedMouseSuppression.MarkRawClick(
@@ -303,7 +431,6 @@ public sealed class GlobalTouchMouseService : IDisposable
         }
         else
         {
-            int error = Marshal.GetLastPInvokeError();
             _ = _mouseInput.ReleaseOwnedButtons();
             _rawTouchState.MarkInjectionFailed(decision.Sequence);
             Debug.WriteLine(
@@ -330,9 +457,13 @@ public sealed class GlobalTouchMouseService : IDisposable
 
     private void ExecuteMouseDecision(TouchMouseDecision decision)
     {
+        if (decision.Action == TouchMouseAction.None)
+            return;
+
+        long started = Stopwatch.GetTimestamp();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
         bool succeeded = decision.Action switch
         {
-            TouchMouseAction.None => true,
             TouchMouseAction.LeftClick => _mouseInput.Click(decision.EndPoint, rightButton: false),
             TouchMouseAction.RightClick => _mouseInput.Click(decision.EndPoint, rightButton: true),
             TouchMouseAction.BeginLeftDrag => _mouseInput.BeginLeftDrag(decision.StartPoint, decision.EndPoint),
@@ -340,10 +471,19 @@ public sealed class GlobalTouchMouseService : IDisposable
             TouchMouseAction.CompleteLeftDrag => _mouseInput.CompleteLeftDrag(decision.StartPoint, decision.EndPoint),
             _ => true,
         };
+        int error = succeeded ? 0 : Marshal.GetLastPInvokeError();
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.Injection,
+            InputTraceBuffer.ElapsedMicroseconds(started),
+            GC.GetAllocatedBytesForCurrentThread() - allocatedBefore,
+            X: decision.EndPoint.X,
+            Y: decision.EndPoint.Y,
+            Code: (int)decision.Action + 100,
+            Result: succeeded ? 1 : -error));
 
         if (!succeeded)
         {
-            int error = Marshal.GetLastPInvokeError();
             _ = _mouseInput.ReleaseOwnedButtons();
             Debug.WriteLine($"SendInput failed for {decision.Action}; Win32 error {error}.");
             ReportDiagnostic(

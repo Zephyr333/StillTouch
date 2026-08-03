@@ -37,6 +37,8 @@ public sealed class GestureRecognitionService : IDisposable
 
     private const uint WM_INPUT = 0x00FF;
     private const uint WM_INPUT_DEVICE_CHANGE = 0x00FE;
+    private const uint WM_DISPLAYCHANGE = 0x007E;
+    private const uint GIDC_ARRIVAL = 1;
     private const uint WM_POINTERUPDATE = 0x0245;
     private const uint WM_POINTERDOWN = 0x0246;
     private const uint WM_POINTERUP = 0x0247;
@@ -46,26 +48,36 @@ public sealed class GestureRecognitionService : IDisposable
     private const ushort DigitizerUsagePage = 0x0D;
     private const ushort ContactIdentifierId = 0x51;
     private const ushort ContactCountId = 0x54;
+    private const ushort ScanTimeId = 0x56;
     private const ushort TipId = 0x42;
+    private const ushort FingerUsage = 0x22;
     private const ushort XCoordinateId = 0x30;
     private const ushort YCoordinateId = 0x31;
     private const ushort TouchScreenUsage = 0x04;
     private const double TapMovementThreshold = 32.0;
     private const double SwipeDistanceThreshold = 90.0;
     private static readonly TimeSpan TapDurationThreshold = TimeSpan.FromMilliseconds(450);
+    private static readonly int RawHidDataOffset =
+        Marshal.OffsetOf<RAWINPUT>("data").ToInt32() +
+        Marshal.OffsetOf<RAWHID>("bRawData").ToInt32();
 
     private readonly WndProcDelegate _wndProc;
+    private readonly InputTraceBuffer _trace;
     private readonly Dictionary<int, PointerStroke> _activeStrokes = [];
-    private readonly Dictionary<nint, ushort> _validRawInputDevices = [];
-    private readonly HashSet<nint> _reportedCoordinateDevices = [];
+    private readonly Dictionary<nint, RawDeviceContext> _rawDevices = [];
+    private readonly HashSet<nint> _unavailableRawDevices = [];
+    private readonly RawTouchFrameAssembler _rawFrameAssembler = new();
+    private readonly RawContactLifecycleTracker _rawLifecycles = new();
+    private readonly RawTouchStreamHealthTracker _rawStreamHealth = new();
+    private readonly List<TouchContactChange> _rawChanges = new(capacity: 16);
     private readonly List<PointerStroke> _completedStrokes = [];
-    private readonly List<RawContact> _rawContacts = [];
     private readonly Subject<RecognizedGesture> _gestureRecognized = new();
     private DateTimeOffset _captureStartedAt;
     private nint _previousWndProc;
     private nint _hwnd;
     private uint _maxContactCount;
-    private int _requiredRawContactCount;
+    private nint _rawInputBuffer;
+    private int _rawInputBufferCapacity;
     private bool _disposed;
     private bool _isEnabled;
 
@@ -81,13 +93,21 @@ public sealed class GestureRecognitionService : IDisposable
 
     internal event Action<string>? DiagnosticMessage;
 
+    internal bool HasRawTouchDevice => _rawDevices.Count > 0;
+
     internal System.Drawing.Point LastGesturePosition { get; private set; }
 
     public GestureRecognitionService(nint hwnd)
+        : this(hwnd, new InputTraceBuffer())
+    {
+    }
+
+    internal GestureRecognitionService(nint hwnd, InputTraceBuffer trace)
     {
         if (hwnd == nint.Zero)
             throw new ArgumentException("Window handle is required.", nameof(hwnd));
 
+        _trace = trace ?? throw new ArgumentNullException(nameof(trace));
         _hwnd = hwnd;
         _wndProc = WndProc;
         _previousWndProc = PInvoke.SetWindowLongPtr(
@@ -137,6 +157,14 @@ public sealed class GestureRecognitionService : IDisposable
 
         IsEnabled = false;
         UnregisterRawTouchInput();
+        ClearRawDevices();
+
+        if (_rawInputBuffer != 0)
+        {
+            Marshal.FreeHGlobal(_rawInputBuffer);
+            _rawInputBuffer = 0;
+            _rawInputBufferCapacity = 0;
+        }
 
         if (_previousWndProc != 0)
             PInvoke.SetWindowLongPtr(new HWND(_hwnd), WINDOW_LONG_PTR_INDEX.GWL_WNDPROC, _previousWndProc);
@@ -149,18 +177,27 @@ public sealed class GestureRecognitionService : IDisposable
         // Managed exceptions must not cross the subclassed native window procedure boundary.
         try
         {
+            // Device and display caches must remain current while conversion is disabled; otherwise
+            // re-enabling after a dock/rotation/device change would reuse stale descriptors.
+            if (msg == WM_INPUT_DEVICE_CHANGE)
+            {
+                HandleRawDeviceChange(wParam, lParam);
+            }
+            else if (msg == WM_DISPLAYCHANGE)
+            {
+                foreach (RawDeviceContext device in _rawDevices.Values)
+                    RefreshDisplayMapping(device, reportMapping: false);
+                ResetCapture();
+                if (_isEnabled)
+                    PublishTouchReset();
+            }
+
             if (_isEnabled)
             {
                 switch (msg)
                 {
                     case WM_INPUT:
                         ProcessRawInput(lParam);
-                        break;
-                    case WM_INPUT_DEVICE_CHANGE:
-                        _validRawInputDevices.Clear();
-                        _reportedCoordinateDevices.Clear();
-                        ResetCapture();
-                        PublishTouchReset();
                         break;
                     case WM_POINTERDOWN:
                         HandlePointerDown(GetPointerId(wParam), TryGetPointerPoint(wParam, out var downPoint) ? downPoint : null);
@@ -208,6 +245,19 @@ public sealed class GestureRecognitionService : IDisposable
 
         if (!PInvoke.RegisterRawInputDevices([device], (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
             throw new InvalidOperationException("Failed to register raw touch input.");
+
+        DiscoverRawTouchDevices();
+    }
+
+    private void HandleRawDeviceChange(nuint change, nint deviceHandle)
+    {
+        RemoveRawDevice(deviceHandle);
+        if ((uint)change == GIDC_ARRIVAL)
+            _ = TryGetRawDeviceContext(deviceHandle, out _);
+
+        ResetCapture();
+        if (_isEnabled)
+            PublishTouchReset();
     }
 
     private void UnregisterRawTouchInput()
@@ -224,153 +274,413 @@ public sealed class GestureRecognitionService : IDisposable
 
     private void ProcessRawInput(nint rawInputHandle)
     {
-        if (!TryReadRawInput(rawInputHandle, out var contacts))
-            return;
-
-        ProcessRawContacts(contacts);
-    }
-
-    private unsafe bool TryReadRawInput(nint rawInputHandle, out IReadOnlyList<RawContact> contacts)
-    {
-        contacts = [];
-        uint size = 0;
-        uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
-        _ = PInvoke.GetRawInputData(new HRAWINPUT((void*)rawInputHandle), RAW_INPUT_DATA_COMMAND_FLAGS.RID_INPUT, null, &size, headerSize);
-        if (size == 0)
-            return false;
-
-        nint buffer = Marshal.AllocHGlobal((int)size);
+        long started = Stopwatch.GetTimestamp();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        int queueDelay = InputTraceBuffer.GetQueueDelayMilliseconds(
+            unchecked((uint)PInvoke.GetMessageTime()));
+        int result = 0;
         try
         {
-            uint readSize = PInvoke.GetRawInputData(new HRAWINPUT((void*)rawInputHandle), RAW_INPUT_DATA_COMMAND_FLAGS.RID_INPUT, (void*)buffer, &size, headerSize);
-            if (readSize != size)
-                return false;
+            if (!TryReadRawInput(rawInputHandle))
+                InvalidateAllRawStreams();
+            else
+                result = 1;
+        }
+        finally
+        {
+            _trace.Record(new(
+                Environment.TickCount64,
+                InputTraceKind.RawHandler,
+                InputTraceBuffer.ElapsedMicroseconds(started),
+                GC.GetAllocatedBytesForCurrentThread() - allocatedBefore,
+                queueDelay,
+                Result: result));
+        }
+    }
 
-            var raw = Marshal.PtrToStructure<RAWINPUT>(buffer);
-            if (raw.header.dwType != (uint)RID_DEVICE_INFO_TYPE.RIM_TYPEHID)
-                return false;
+    private unsafe bool TryReadRawInput(nint rawInputHandle)
+    {
+        uint size = 0;
+        uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
+        _ = PInvoke.GetRawInputData(
+            new HRAWINPUT((void*)rawInputHandle),
+            RAW_INPUT_DATA_COMMAND_FLAGS.RID_INPUT,
+            null,
+            &size,
+            headerSize);
+        if (size == 0 || size > int.MaxValue)
+            return false;
 
-            if (!TryGetRawInputUsage((nint)raw.header.hDevice, out ushort usage) || usage != TouchScreenUsage)
-                return false;
+        EnsureRawInputBuffer((int)size);
+        uint readSize = PInvoke.GetRawInputData(
+            new HRAWINPUT((void*)rawInputHandle),
+            RAW_INPUT_DATA_COMMAND_FLAGS.RID_INPUT,
+            (void*)_rawInputBuffer,
+            &size,
+            headerSize);
+        if (readSize != size)
+            return false;
 
-            bool hasContactCount = TryGetContactCount((nint)raw.header.hDevice, buffer, raw, out int contactCount);
-            if (hasContactCount && contactCount == 0)
+        if (readSize < (uint)RawHidDataOffset)
+            return false;
+
+        ref readonly RAWINPUT raw = ref *(RAWINPUT*)_rawInputBuffer;
+        if (raw.header.dwSize > readSize ||
+            raw.header.dwSize < (uint)RawHidDataOffset)
+        {
+            return false;
+        }
+
+        if (raw.header.dwType != (uint)RID_DEVICE_INFO_TYPE.RIM_TYPEHID)
+            return false;
+
+        nint deviceHandle = (nint)raw.header.hDevice;
+        if (!TryGetRawDeviceContext(deviceHandle, out RawDeviceContext? foundDevice) ||
+            foundDevice is null)
+        {
+            return true;
+        }
+        RawDeviceContext device = foundDevice;
+
+        var hid = raw.data.hid;
+        if (hid.dwSizeHid == 0 || hid.dwCount == 0 ||
+            hid.dwSizeHid > int.MaxValue || hid.dwCount > int.MaxValue)
+        {
+            InvalidateRawStream(deviceHandle);
+            return true;
+        }
+
+        ulong rawBytes = (ulong)hid.dwSizeHid * hid.dwCount;
+        ulong availableRawBytes = raw.header.dwSize - (uint)RawHidDataOffset;
+        if (rawBytes > availableRawBytes || rawBytes > int.MaxValue)
+        {
+            InvalidateRawStream(deviceHandle);
+            return true;
+        }
+
+        nint rawData = _rawInputBuffer + RawHidDataOffset;
+        for (int packetIndex = 0; packetIndex < (int)hid.dwCount; packetIndex++)
+        {
+            nint packet = rawData + packetIndex * (int)hid.dwSizeHid;
+            if (!TryGetReportValue(
+                    device,
+                    packet,
+                    (int)hid.dwSizeHid,
+                    DigitizerUsagePage,
+                    ContactCountId,
+                    out uint rawContactCount))
             {
-                contacts = _activeStrokes
-                    .Select(static pair => new RawContact(pair.Key, false, pair.Value.LastPoint))
-                    .ToArray();
-                return contacts.Count > 0;
+                InvalidateRawStream(deviceHandle);
+                return true;
             }
 
-            if (hasContactCount)
+            bool hasScanTime = TryGetReportValue(
+                device,
+                packet,
+                (int)hid.dwSizeHid,
+                DigitizerUsagePage,
+                ScanTimeId,
+                out uint scanTime);
+            if (rawContactCount > 256)
             {
-                _requiredRawContactCount = contactCount;
-                _rawContacts.Clear();
+                InvalidateRawStream(deviceHandle);
+                return true;
             }
 
-            if (_requiredRawContactCount == 0)
-                return false;
+            int contactCount = (int)rawContactCount;
+            int remaining = contactCount > 0
+                ? contactCount
+                : _rawFrameAssembler.GetRemainingContactCount(deviceHandle);
+            int contactsInPacket = Math.Min(remaining, device.ContactCollections.Length);
+            _trace.Record(new(
+                Environment.TickCount64,
+                InputTraceKind.RawReport,
+                DeviceHandle: deviceHandle,
+                ScanTime: hasScanTime ? scanTime : 0,
+                ActiveContactCount: contactCount,
+                MaxContactCount: remaining,
+                Code: hasScanTime ? 1 : 0,
+                Result: contactsInPacket));
 
-            var hid = raw.data.hid;
-            nint rawData = buffer + ((int)raw.header.dwSize - (int)(hid.dwSizeHid * hid.dwCount));
-            using var preparsedData = GetPreparsedData((nint)raw.header.hDevice);
-            var linkNodes = GetLinkCollectionNodes(preparsedData.Handle);
-            int childCount = linkNodes.Length > 0 ? linkNodes[0].NumberOfChildren : 1;
-            if (childCount <= 0)
-                childCount = contactCount;
-
-            var logicalBounds = GetLogicalBounds(preparsedData.Handle, linkNodes.Length);
-            if (!logicalBounds.IsValid)
+            if (contactsInPacket == 0)
             {
-                _rawContacts.Clear();
-                _requiredRawContactCount = 0;
-                return false;
+                RawTouchFrameResult emptyResult = _rawFrameAssembler.AppendReport(
+                    deviceHandle,
+                    hasContactCount: true,
+                    contactCount,
+                    hasScanTime,
+                    scanTime,
+                    ReadOnlySpan<RawDecodedContact>.Empty);
+                HandleRawFrameResult(deviceHandle, emptyResult);
+                continue;
             }
 
-            for (int packetIndex = 0; packetIndex < hid.dwCount && _requiredRawContactCount > 0; packetIndex++)
+            for (int contactIndex = 0; contactIndex < contactsInPacket; contactIndex++)
             {
-                nint packet = rawData + packetIndex * (int)hid.dwSizeHid;
-                for (ushort nodeIndex = 1; nodeIndex <= childCount && _requiredRawContactCount > 0; nodeIndex++)
+                if (!TryReadRawContact(
+                        device,
+                        packet,
+                        (int)hid.dwSizeHid,
+                        device.ContactCollections[contactIndex],
+                        out device.ContactScratch[contactIndex]))
                 {
-                    if (!TryReadRawContact(
-                            (nint)raw.header.hDevice,
-                            preparsedData.Handle,
-                            packet,
-                            (int)hid.dwSizeHid,
-                            nodeIndex,
-                            logicalBounds,
-                            out var contact))
-                    {
-                        _rawContacts.Clear();
-                        _requiredRawContactCount = 0;
-                        return false;
-                    }
-
-                    _rawContacts.Add(contact);
-                    _requiredRawContactCount--;
+                    InvalidateRawStream(deviceHandle);
+                    return true;
                 }
             }
 
-            if (_requiredRawContactCount != 0)
-                return false;
+            RawTouchFrameResult result = _rawFrameAssembler.AppendReport(
+                deviceHandle,
+                hasContactCount: true,
+                contactCount,
+                hasScanTime,
+                scanTime,
+                device.ContactScratch.AsSpan(0, contactsInPacket));
+            HandleRawFrameResult(deviceHandle, result);
+        }
 
-            contacts = _rawContacts.ToArray();
-            return true;
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
+        return true;
     }
 
-    private unsafe bool TryGetRawInputUsage(nint deviceHandle, out ushort usage)
+    private void HandleRawFrameResult(
+        nint deviceHandle,
+        RawTouchFrameResult result)
     {
-        usage = 0;
-        if (_validRawInputDevices.TryGetValue(deviceHandle, out usage))
-            return true;
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.RawFrame,
+            DeviceHandle: deviceHandle,
+            FrameEpoch: result.FrameEpoch,
+            ScanTime: result.ScanTime,
+            ActiveContactCount: result.Contacts?.Count ?? 0,
+            Code: (int)result.Status,
+            Result: result.HadDiscontinuity ? 1 : 0));
 
-        uint size = 0;
-        _ = PInvoke.GetRawInputDeviceInfo(new HANDLE((void*)deviceHandle), RAW_INPUT_DEVICE_INFO_COMMAND.RIDI_DEVICEINFO, null, &size);
-        if (size == 0)
+        if (result.Status == RawTouchFrameStatus.Pending)
+            return;
+
+        if (result.Status != RawTouchFrameStatus.Completed ||
+            result.Contacts is not { } completedContacts)
+        {
+            InvalidateRawStream(deviceHandle);
+            return;
+        }
+
+        if (result.HadDiscontinuity)
+            InvalidateRawStream(deviceHandle);
+
+        RawTouchStreamDecision stream =
+            _rawStreamHealth.ObserveCompletedFrame(deviceHandle, completedContacts);
+        if (stream.Disposition != RawTouchStreamDisposition.Accepted)
+        {
+            _trace.Record(new(
+                Environment.TickCount64,
+                InputTraceKind.RawStream,
+                DeviceHandle: deviceHandle,
+                StreamEpoch: stream.StreamEpoch,
+                Code: (int)stream.Disposition));
+            // A complete all-lifted frame changes Quarantined -> Resynchronized but is not itself
+            // published. The next physical Down is the first frame eligible for conversion.
+            return;
+        }
+
+        ProcessRawFrame(
+            result.DeviceHandle,
+            result.FrameEpoch,
+            result.ScanTime,
+            completedContacts,
+            stream.StreamEpoch);
+    }
+
+    private void InvalidateRawStream(nint deviceHandle)
+    {
+        long streamEpoch = _rawStreamHealth.MarkDiscontinuity(deviceHandle);
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.RawStream,
+            DeviceHandle: deviceHandle,
+            StreamEpoch: streamEpoch,
+            Code: (int)RawTouchStreamDisposition.Quarantined,
+            Result: 1));
+        _rawFrameAssembler.ResetDevice(deviceHandle);
+        _rawLifecycles.ResetDevice(deviceHandle);
+        _rawChanges.Clear();
+        PublishTouchReset();
+    }
+
+    private void InvalidateAllRawStreams()
+    {
+        foreach (nint deviceHandle in _rawDevices.Keys)
+        {
+            long streamEpoch = _rawStreamHealth.MarkDiscontinuity(deviceHandle);
+            _trace.Record(new(
+                Environment.TickCount64,
+                InputTraceKind.RawStream,
+                DeviceHandle: deviceHandle,
+                StreamEpoch: streamEpoch,
+                Code: (int)RawTouchStreamDisposition.Quarantined,
+                Result: 2));
+        }
+
+        _rawFrameAssembler.Reset();
+        _rawLifecycles.Reset();
+        _rawChanges.Clear();
+        PublishTouchReset();
+    }
+
+    private unsafe void EnsureRawInputBuffer(int requiredSize)
+    {
+        if (requiredSize <= _rawInputBufferCapacity)
+            return;
+
+        int newCapacity = Math.Max(requiredSize, Math.Max(1024, _rawInputBufferCapacity * 2));
+        _rawInputBuffer = _rawInputBuffer == 0
+            ? Marshal.AllocHGlobal(newCapacity)
+            : Marshal.ReAllocHGlobal(_rawInputBuffer, newCapacity);
+        _rawInputBufferCapacity = newCapacity;
+    }
+
+    private unsafe bool TryGetRawDeviceContext(
+        nint deviceHandle,
+        out RawDeviceContext? context)
+    {
+        if (_rawDevices.TryGetValue(deviceHandle, out context))
+            return true;
+        if (deviceHandle == 0 || _unavailableRawDevices.Contains(deviceHandle))
             return false;
 
-        nint buffer = Marshal.AllocHGlobal((int)size);
+        RID_DEVICE_INFO info = default;
+        info.cbSize = (uint)sizeof(RID_DEVICE_INFO);
+        uint size = info.cbSize;
+        uint result = PInvoke.GetRawInputDeviceInfo(
+            new HANDLE((void*)deviceHandle),
+            RAW_INPUT_DEVICE_INFO_COMMAND.RIDI_DEVICEINFO,
+            &info,
+            &size);
+        if (result == uint.MaxValue ||
+            info.dwType != RID_DEVICE_INFO_TYPE.RIM_TYPEHID ||
+            info.Anonymous.hid.usUsagePage != DigitizerUsagePage ||
+            info.Anonymous.hid.usUsage != TouchScreenUsage)
+        {
+            _unavailableRawDevices.Add(deviceHandle);
+            return false;
+        }
+
+        PreparsedDataHandle? preparsedData = null;
         try
         {
-            uint result = PInvoke.GetRawInputDeviceInfo(new HANDLE((void*)deviceHandle), RAW_INPUT_DEVICE_INFO_COMMAND.RIDI_DEVICEINFO, (void*)buffer, &size);
-            if (result == uint.MaxValue)
+            preparsedData = GetPreparsedData(deviceHandle);
+            if (!IsHidSuccess(PInvoke.HidP_GetCaps(preparsedData.Handle, out HIDP_CAPS caps)))
+            {
+                _unavailableRawDevices.Add(deviceHandle);
                 return false;
+            }
 
-            var info = Marshal.PtrToStructure<RID_DEVICE_INFO>(buffer);
-            usage = info.Anonymous.hid.usUsage;
-            _validRawInputDevices[deviceHandle] = usage;
+            HIDP_LINK_COLLECTION_NODE[] linkNodes = GetLinkCollectionNodes(
+                preparsedData.Handle,
+                caps.NumberLinkCollectionNodes);
+            ushort[] contactCollections = GetContactCollections(linkNodes);
+            CoordinateBounds logicalBounds = GetLogicalBounds(
+                preparsedData.Handle,
+                caps.NumberInputValueCaps);
+            if (contactCollections.Length == 0 || !logicalBounds.IsValid)
+            {
+                _unavailableRawDevices.Add(deviceHandle);
+                return false;
+            }
+
+            uint maximumUsageLength = PInvoke.HidP_MaxUsageListLength(
+                HIDP_REPORT_TYPE.HidP_Input,
+                DigitizerUsagePage,
+                preparsedData.Handle);
+            int usageCapacity = (int)Math.Clamp(maximumUsageLength, 8, 1024);
+            context = new RawDeviceContext(
+                deviceHandle,
+                preparsedData,
+                contactCollections,
+                logicalBounds,
+                usageCapacity);
+            preparsedData = null;
+            RefreshDisplayMapping(context, reportMapping: true);
+            _rawDevices.Add(deviceHandle, context);
             return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Debug.WriteLine($"Unable to cache raw touch descriptor: {ex}");
+            _unavailableRawDevices.Add(deviceHandle);
+            return false;
         }
         finally
         {
-            Marshal.FreeHGlobal(buffer);
+            preparsedData?.Dispose();
         }
     }
 
-    private static unsafe bool TryGetContactCount(nint deviceHandle, nint rawInputBuffer, RAWINPUT raw, out int contactCount)
+    private unsafe void DiscoverRawTouchDevices()
     {
-        var hid = raw.data.hid;
-        nint rawData = rawInputBuffer + ((int)raw.header.dwSize - (int)(hid.dwSizeHid * hid.dwCount));
-        using var preparsedData = GetPreparsedData(deviceHandle);
-        uint rawContactCount = 0;
-        var status = PInvoke.HidP_GetUsageValue(
-            HIDP_REPORT_TYPE.HidP_Input,
-            DigitizerUsagePage,
-            0,
-            ContactCountId,
-            out rawContactCount,
-            preparsedData.Handle,
-            new PSTR((byte*)rawData),
-            hid.dwSizeHid);
+        uint count = 0;
+        uint elementSize = (uint)sizeof(RAWINPUTDEVICELIST);
+        uint initialResult = PInvoke.GetRawInputDeviceList(
+            Span<RAWINPUTDEVICELIST>.Empty,
+            ref count,
+            elementSize);
+        if (initialResult == uint.MaxValue || count == 0 || count > 4096)
+            return;
 
-        bool succeeded = IsHidSuccess(status);
-        contactCount = succeeded ? (int)rawContactCount : 0;
-        return succeeded;
+        var devices = new RAWINPUTDEVICELIST[count];
+        uint listed = PInvoke.GetRawInputDeviceList(devices, ref count, elementSize);
+        if (listed == uint.MaxValue)
+            return;
+
+        int length = (int)Math.Min(listed, count);
+        for (int index = 0; index < length; index++)
+        {
+            if (devices[index].dwType == RID_DEVICE_INFO_TYPE.RIM_TYPEHID)
+                _ = TryGetRawDeviceContext((nint)devices[index].hDevice, out _);
+        }
+    }
+
+    private void RemoveRawDevice(nint deviceHandle)
+    {
+        if (_rawDevices.Remove(deviceHandle, out RawDeviceContext? context))
+            context.Dispose();
+        _unavailableRawDevices.Remove(deviceHandle);
+        _rawFrameAssembler.ResetDevice(deviceHandle);
+        _rawLifecycles.ResetDevice(deviceHandle);
+        _rawStreamHealth.RemoveDevice(deviceHandle);
+    }
+
+    private void ClearRawDevices()
+    {
+        foreach (RawDeviceContext context in _rawDevices.Values)
+            context.Dispose();
+        _rawDevices.Clear();
+        _unavailableRawDevices.Clear();
+        _rawFrameAssembler.Reset();
+        _rawLifecycles.Clear();
+        _rawStreamHealth.Reset();
+        _rawChanges.Clear();
+    }
+
+    private static unsafe bool TryGetReportValue(
+        RawDeviceContext device,
+        nint packet,
+        int packetSize,
+        ushort usagePage,
+        ushort usage,
+        out uint value)
+    {
+        NTSTATUS status = PInvoke.HidP_GetUsageValue(
+            HIDP_REPORT_TYPE.HidP_Input,
+            usagePage,
+            0,
+            usage,
+            out value,
+            device.PreparsedData.Handle,
+            new PSTR((byte*)packet),
+            (uint)packetSize);
+        return IsHidSuccess(status);
     }
 
     private static unsafe PreparsedDataHandle GetPreparsedData(nint deviceHandle)
@@ -391,26 +701,45 @@ public sealed class GestureRecognitionService : IDisposable
         return new(new PHIDP_PREPARSED_DATA(handle));
     }
 
-    private static HIDP_LINK_COLLECTION_NODE[] GetLinkCollectionNodes(PHIDP_PREPARSED_DATA preparsedData)
+    private static HIDP_LINK_COLLECTION_NODE[] GetLinkCollectionNodes(
+        PHIDP_PREPARSED_DATA preparsedData,
+        ushort expectedCount)
     {
-        uint count = 0;
-        _ = PInvoke.HidP_GetLinkCollectionNodes([], ref count, preparsedData);
-        if (count <= 0)
+        if (expectedCount == 0)
             return [];
 
+        uint count = expectedCount;
         var nodes = new HIDP_LINK_COLLECTION_NODE[count];
         var status = PInvoke.HidP_GetLinkCollectionNodes(nodes, ref count, preparsedData);
-        if (!IsHidSuccess(status))
+        if (!IsHidSuccess(status) || count == 0 || count > nodes.Length)
             return [];
+
+        if (count < nodes.Length)
+            Array.Resize(ref nodes, (int)count);
 
         return nodes;
     }
 
+    private static ushort[] GetContactCollections(HIDP_LINK_COLLECTION_NODE[] nodes)
+    {
+        var collections = new List<ushort>(Math.Max(1, nodes.Length - 1));
+        for (ushort index = 1; index < nodes.Length; index++)
+        {
+            if (nodes[index].LinkUsagePage == DigitizerUsagePage &&
+                nodes[index].LinkUsage == FingerUsage)
+            {
+                collections.Add(index);
+            }
+        }
+
+        return collections.ToArray();
+    }
+
     private static CoordinateBounds GetLogicalBounds(
         PHIDP_PREPARSED_DATA preparsedData,
-        int collectionCount)
+        ushort inputValueCapsCount)
     {
-        int count = Math.Max(collectionCount, 1);
+        int count = Math.Max(inputValueCapsCount, (ushort)1);
         var caps = new HIDP_VALUE_CAPS[count];
         ushort capsLength = (ushort)caps.Length;
         var xStatus = PInvoke.HidP_GetSpecificValueCaps(
@@ -456,23 +785,20 @@ public sealed class GestureRecognitionService : IDisposable
     }
 
     private unsafe bool TryReadRawContact(
-        nint deviceHandle,
-        PHIDP_PREPARSED_DATA preparsedData,
+        RawDeviceContext device,
         nint packet,
         int packetSize,
         ushort nodeIndex,
-        CoordinateBounds logicalBounds,
-        out RawContact contact)
+        out RawDecodedContact contact)
     {
         contact = default;
-        uint contactId = 0;
-        _ = PInvoke.HidP_GetUsageValue(
+        NTSTATUS contactIdStatus = PInvoke.HidP_GetUsageValue(
             HIDP_REPORT_TYPE.HidP_Input,
             DigitizerUsagePage,
             nodeIndex,
             ContactIdentifierId,
-            out contactId,
-            preparsedData,
+            out uint contactId,
+            device.PreparsedData.Handle,
             new PSTR((byte*)packet),
             (uint)packetSize);
 
@@ -484,7 +810,7 @@ public sealed class GestureRecognitionService : IDisposable
             nodeIndex,
             XCoordinateId,
             out logicalX,
-            preparsedData,
+            device.PreparsedData.Handle,
             new PSTR((byte*)packet),
             (uint)packetSize);
         var yStatus = PInvoke.HidP_GetUsageValue(
@@ -493,111 +819,124 @@ public sealed class GestureRecognitionService : IDisposable
             nodeIndex,
             YCoordinateId,
             out logicalY,
-            preparsedData,
+            device.PreparsedData.Handle,
             new PSTR((byte*)packet),
             (uint)packetSize);
 
-        if (!IsHidSuccess(xStatus) || !IsHidSuccess(yStatus))
+        if (!IsHidSuccess(contactIdStatus) ||
+            !IsHidSuccess(xStatus) ||
+            !IsHidSuccess(yStatus) ||
+            !TryReadTipContact(device, packet, packetSize, nodeIndex, out bool isTip))
+        {
             return false;
+        }
 
         var point = ScaleToScreen(
-            deviceHandle,
+            device,
             unchecked((int)logicalX),
-            unchecked((int)logicalY),
-            logicalBounds);
-        bool isTip = IsTipContact(preparsedData, packet, packetSize, nodeIndex);
-        contact = new((int)contactId, isTip, point);
+            unchecked((int)logicalY));
+        contact = new(
+            (int)contactId,
+            isTip,
+            new System.Drawing.Point(point.X, point.Y));
         return true;
     }
 
-    private static unsafe bool IsTipContact(PHIDP_PREPARSED_DATA preparsedData, nint packet, int packetSize, ushort nodeIndex)
+    private static unsafe bool TryReadTipContact(
+        RawDeviceContext device,
+        nint packet,
+        int packetSize,
+        ushort nodeIndex,
+        out bool isTip)
     {
-        uint usageLength = 0;
-        _ = PInvoke.HidP_GetUsages(
+        uint usageLength = (uint)device.UsageScratch.Length;
+        NTSTATUS status = PInvoke.HidP_GetUsages(
             HIDP_REPORT_TYPE.HidP_Input,
             DigitizerUsagePage,
             nodeIndex,
-            [],
+            device.UsageScratch,
             ref usageLength,
-            preparsedData,
+            device.PreparsedData.Handle,
             new PSTR((byte*)packet),
             (uint)packetSize);
 
-        if (usageLength <= 0)
-            return false;
-
-        var usages = new ushort[usageLength];
-        var status = PInvoke.HidP_GetUsages(
-            HIDP_REPORT_TYPE.HidP_Input,
-            DigitizerUsagePage,
-            nodeIndex,
-            usages,
-            ref usageLength,
-            preparsedData,
-            new PSTR((byte*)packet),
-            (uint)packetSize);
-
-        return IsHidSuccess(status) &&
-            usages.Take((int)usageLength).Contains(TipId);
-    }
-
-    private unsafe PointerPoint ScaleToScreen(
-        nint deviceHandle,
-        int logicalX,
-        int logicalY,
-        CoordinateBounds logicalBounds)
-    {
-        RECT deviceRect;
-        RECT displayRect;
-        if (deviceHandle != 0 &&
-            PInvoke.GetPointerDeviceRects(
-                new HANDLE((void*)deviceHandle),
-                &deviceRect,
-                &displayRect))
+        if (!IsHidSuccess(status))
         {
-            ReportCoordinateMappingOnce(
-                deviceHandle,
-                logicalBounds,
-                deviceRect,
-                displayRect,
-                usedPointerMapping: true);
-            return new(
-                ScaleCoordinate(
-                    logicalX,
-                    logicalBounds.X.Minimum,
-                    logicalBounds.X.Maximum,
-                    displayRect.left,
-                    displayRect.right),
-                ScaleCoordinate(
-                    logicalY,
-                    logicalBounds.Y.Minimum,
-                    logicalBounds.Y.Maximum,
-                    displayRect.top,
-                    displayRect.bottom));
+            isTip = false;
+            return false;
         }
 
-        int screenWidth = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXSCREEN));
-        int screenHeight = Math.Max(1, PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYSCREEN));
-        displayRect = new RECT(0, 0, screenWidth, screenHeight);
-        ReportCoordinateMappingOnce(
-            deviceHandle,
-            logicalBounds,
-            default,
-            displayRect,
-            usedPointerMapping: false);
+        isTip = false;
+        int length = (int)Math.Min(usageLength, (uint)device.UsageScratch.Length);
+        for (int index = 0; index < length; index++)
+        {
+            if (device.UsageScratch[index] == TipId)
+            {
+                isTip = true;
+                break;
+            }
+        }
+
+        return true;
+    }
+
+    private static PointerPoint ScaleToScreen(
+        RawDeviceContext device,
+        int logicalX,
+        int logicalY)
+    {
+        CoordinateBounds logicalBounds = device.LogicalBounds;
+        RECT displayRect = device.DisplayRect;
         return new(
             ScaleCoordinate(
                 logicalX,
                 logicalBounds.X.Minimum,
                 logicalBounds.X.Maximum,
-                0,
-                screenWidth),
+                displayRect.left,
+                displayRect.right),
             ScaleCoordinate(
                 logicalY,
                 logicalBounds.Y.Minimum,
                 logicalBounds.Y.Maximum,
-                0,
-                screenHeight));
+                displayRect.top,
+                displayRect.bottom));
+    }
+
+    private unsafe void RefreshDisplayMapping(
+        RawDeviceContext device,
+        bool reportMapping)
+    {
+        RECT deviceRect = default;
+        RECT displayRect;
+        bool usedPointerMapping = PInvoke.GetPointerDeviceRects(
+            new HANDLE((void*)device.DeviceHandle),
+            &deviceRect,
+            &displayRect);
+        if (!usedPointerMapping)
+        {
+            int left = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_XVIRTUALSCREEN);
+            int top = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_YVIRTUALSCREEN);
+            int width = Math.Max(
+                1,
+                PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXVIRTUALSCREEN));
+            int height = Math.Max(
+                1,
+                PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYVIRTUALSCREEN));
+            displayRect = new RECT(left, top, left + width, top + height);
+        }
+
+        device.DeviceRect = deviceRect;
+        device.DisplayRect = displayRect;
+        device.UsedPointerMapping = usedPointerMapping;
+        if (reportMapping)
+        {
+            ReportCoordinateMappingOnce(
+                device.DeviceHandle,
+                device.LogicalBounds,
+                deviceRect,
+                displayRect,
+                usedPointerMapping);
+        }
     }
 
     private void ReportCoordinateMappingOnce(
@@ -607,8 +946,25 @@ public sealed class GestureRecognitionService : IDisposable
         RECT displayRect,
         bool usedPointerMapping)
     {
-        if (!_reportedCoordinateDevices.Add(deviceHandle))
-            return;
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.DeviceMapping,
+            DeviceHandle: deviceHandle,
+            X: logicalBounds.X.Minimum,
+            Y: logicalBounds.Y.Minimum,
+            ActiveContactCount: logicalBounds.X.Maximum,
+            MaxContactCount: logicalBounds.Y.Maximum,
+            Code: 0));
+        _trace.Record(new(
+            Environment.TickCount64,
+            InputTraceKind.DeviceMapping,
+            DeviceHandle: deviceHandle,
+            X: displayRect.left,
+            Y: displayRect.top,
+            ActiveContactCount: displayRect.right,
+            MaxContactCount: displayRect.bottom,
+            Code: 1,
+            Result: usedPointerMapping ? 1 : 0));
 
         string pointerRange = usedPointerMapping
             ? $"HIMETRIC=({pointerDeviceRect.left},{pointerDeviceRect.top}).." +
@@ -647,77 +1003,73 @@ public sealed class GestureRecognitionService : IDisposable
             (int)Math.Round(sourceOffset * (targetSpan - 1.0) / sourceSpan);
     }
 
-    private void ProcessRawContacts(IReadOnlyList<RawContact> contacts)
+    private void ProcessRawFrame(
+        nint deviceHandle,
+        long frameEpoch,
+        uint scanTime,
+        List<RawDecodedContact> contacts,
+        long rawStreamEpoch)
     {
         long timestamp = Environment.TickCount64;
-        foreach (var contact in contacts)
+        CurrentTouchSnapshot = _rawLifecycles.ProcessFrame(
+            deviceHandle,
+            frameEpoch,
+            scanTime,
+            contacts,
+            timestamp,
+            _rawChanges,
+            rawStreamEpoch);
+        for (int index = 0; index < _rawChanges.Count; index++)
         {
-            if (contact.IsTip)
-            {
-                bool wasActive = _activeStrokes.ContainsKey(contact.Id);
-                if (wasActive)
-                    HandlePointerUpdate(contact.Id, contact.Point);
-                else
-                    HandlePointerDown(contact.Id, contact.Point);
-
-                if (_activeStrokes.ContainsKey(contact.Id))
-                {
-                    PublishTouchContactChange(
-                        contact,
-                        wasActive ? TouchContactChangeKind.Move : TouchContactChangeKind.Down,
-                        timestamp);
-                }
-            }
-            else
-            {
-                bool wasActive = _activeStrokes.ContainsKey(contact.Id);
-                HandlePointerUp(contact.Id, contact.Point);
-                if (wasActive)
-                    PublishTouchContactChange(contact, TouchContactChangeKind.Up, timestamp);
-            }
+            TouchContactChange change = _rawChanges[index];
+            _trace.Record(new(
+                change.TimestampMilliseconds,
+                InputTraceKind.RawContact,
+                DeviceHandle: change.DeviceHandle,
+                StreamEpoch: change.RawStreamEpoch,
+                FrameEpoch: change.FrameEpoch,
+                ContactId: change.ContactId,
+                ContactGeneration: change.ContactGeneration,
+                ScanTime: change.ScanTime,
+                X: change.Position.X,
+                Y: change.Position.Y,
+                ActiveContactCount: change.ActiveContactCount,
+                MaxContactCount: change.MaxContactCount,
+                Code: (int)change.Kind));
+            TouchContactChanged?.Invoke(change);
         }
-
-        PublishTouchSnapshot();
-
-        if (_activeStrokes.Count == 0 && _completedStrokes.Count > 0)
-            CompleteCapture();
-        else if (ShouldTriggerEarlySwipe())
-            CompleteCapture();
-    }
-
-    private void PublishTouchSnapshot()
-    {
-        CurrentTouchSnapshot = new(
-            _activeStrokes.Count,
-            (int)_maxContactCount,
-            Environment.TickCount64);
         TouchSnapshotChanged?.Invoke(CurrentTouchSnapshot);
-    }
-
-    private void PublishTouchContactChange(
-        RawContact contact,
-        TouchContactChangeKind kind,
-        long timestamp)
-    {
-        TouchContactChanged?.Invoke(new(
-            contact.Id,
-            kind,
-            new System.Drawing.Point(contact.Point.X, contact.Point.Y),
-            _activeStrokes.Count,
-            (int)_maxContactCount,
-            timestamp));
     }
 
     private void PublishTouchReset()
     {
-        PublishTouchSnapshot();
-        TouchContactChanged?.Invoke(new(
+        CurrentTouchSnapshot = new(
+            _rawLifecycles.ActiveContactCount,
             0,
-            TouchContactChangeKind.Reset,
-            System.Drawing.Point.Empty,
-            0,
-            0,
-            Environment.TickCount64));
+            Environment.TickCount64);
+        try
+        {
+            TouchSnapshotChanged?.Invoke(CurrentTouchSnapshot);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Debug.WriteLine($"Touch reset snapshot subscriber failed: {ex}");
+        }
+
+        try
+        {
+            TouchContactChanged?.Invoke(new(
+                0,
+                TouchContactChangeKind.Reset,
+                System.Drawing.Point.Empty,
+                0,
+                0,
+                Environment.TickCount64));
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Debug.WriteLine($"Touch reset contact subscriber failed: {ex}");
+        }
     }
 
     // Trigger early when one finger lifts with a swipe and the remaining fingers are stationary (held).
@@ -843,11 +1195,21 @@ public sealed class GestureRecognitionService : IDisposable
 
     private void ResetCapture()
     {
+        bool interruptedRawLifecycle =
+            _rawLifecycles.ActiveContactCount > 0 ||
+            _rawFrameAssembler.HasPendingFrames;
+        if (interruptedRawLifecycle)
+        {
+            foreach (nint deviceHandle in _rawDevices.Keys)
+                _ = _rawStreamHealth.MarkDiscontinuity(deviceHandle);
+        }
+
         _activeStrokes.Clear();
         _completedStrokes.Clear();
-        _rawContacts.Clear();
+        _rawLifecycles.Reset();
+        _rawChanges.Clear();
+        _rawFrameAssembler.Reset();
         _maxContactCount = 0;
-        _requiredRawContactCount = 0;
     }
 
     private static bool TryGetPointerPoint(nuint wParam, out PointerPoint point)
@@ -875,8 +1237,6 @@ public sealed class GestureRecognitionService : IDisposable
     private static bool IsHidSuccess(NTSTATUS status) =>
         (int)status.Value == HIDP_STATUS_SUCCESS;
 
-    private readonly record struct RawContact(int Id, bool IsTip, PointerPoint Point);
-
     private readonly record struct PointerPoint(int X, int Y);
 
     private readonly record struct CoordinateRange(int Minimum, int Maximum)
@@ -887,6 +1247,44 @@ public sealed class GestureRecognitionService : IDisposable
     private readonly record struct CoordinateBounds(CoordinateRange X, CoordinateRange Y)
     {
         public bool IsValid => X.IsValid && Y.IsValid;
+    }
+
+    private sealed class RawDeviceContext : IDisposable
+    {
+        public RawDeviceContext(
+            nint deviceHandle,
+            PreparsedDataHandle preparsedData,
+            ushort[] contactCollections,
+            CoordinateBounds logicalBounds,
+            int usageCapacity)
+        {
+            DeviceHandle = deviceHandle;
+            PreparsedData = preparsedData;
+            ContactCollections = contactCollections;
+            LogicalBounds = logicalBounds;
+            UsageScratch = new ushort[usageCapacity];
+            ContactScratch = new RawDecodedContact[contactCollections.Length];
+        }
+
+        public nint DeviceHandle { get; }
+
+        public PreparsedDataHandle PreparsedData { get; }
+
+        public ushort[] ContactCollections { get; }
+
+        public CoordinateBounds LogicalBounds { get; }
+
+        public ushort[] UsageScratch { get; }
+
+        public RawDecodedContact[] ContactScratch { get; }
+
+        public RECT DeviceRect { get; set; }
+
+        public RECT DisplayRect { get; set; }
+
+        public bool UsedPointerMapping { get; set; }
+
+        public void Dispose() => PreparsedData.Dispose();
     }
 
     private sealed class PointerStroke

@@ -44,6 +44,7 @@ internal sealed class TouchMouseStateMachine
         int movementThresholdPixels)
     {
         bool snapshotIsRecent = snapshot.IsRecent(nowMilliseconds, SnapshotMaximumAgeMilliseconds);
+        int observedActiveContacts = snapshotIsRecent ? snapshot.ActiveContactCount : 0;
         int observedMaxContacts = snapshotIsRecent ? snapshot.MaxContactCount : 0;
 
         if (_candidate is { } candidate)
@@ -53,13 +54,23 @@ internal sealed class TouchMouseStateMachine
             candidate.MovementExceeded |= IsBeyondThreshold(
                 candidate.StartPoint,
                 point,
-                movementThresholdPixels);
+                candidate.MovementThresholdPixels);
         }
 
         return message switch
         {
-            TouchMouseMessage.LeftDown => HandleLeftDown(point, snapshotIsRecent, observedMaxContacts),
-            TouchMouseMessage.RightDown => HandleRightDown(point, snapshotIsRecent, observedMaxContacts),
+            TouchMouseMessage.LeftDown => HandleLeftDown(
+                point,
+                snapshotIsRecent,
+                observedActiveContacts,
+                observedMaxContacts,
+                movementThresholdPixels),
+            TouchMouseMessage.RightDown => HandleRightDown(
+                point,
+                snapshotIsRecent,
+                observedActiveContacts,
+                observedMaxContacts,
+                movementThresholdPixels),
             TouchMouseMessage.Move => HandleMove(),
             TouchMouseMessage.LeftUp => HandleLeftUp(),
             TouchMouseMessage.RightUp => HandleRightUp(),
@@ -86,21 +97,59 @@ internal sealed class TouchMouseStateMachine
         return false;
     }
 
-    private TouchMouseDecision HandleLeftDown(Point point, bool snapshotIsRecent, int observedMaxContacts)
+    private TouchMouseDecision HandleLeftDown(
+        Point point,
+        bool snapshotIsRecent,
+        int observedActiveContacts,
+        int observedMaxContacts,
+        int movementThresholdPixels)
     {
-        if (!snapshotIsRecent || observedMaxContacts != 1)
+        if (_state == State.ReplayedDrag && _candidate is { } replayed)
+        {
+            var release = new TouchMouseDecision(
+                true,
+                TouchMouseAction.EndLeftDrag,
+                replayed.StartPoint,
+                replayed.LastPoint);
+            Reset();
+            return release;
+        }
+
+        if (!snapshotIsRecent ||
+            observedActiveContacts != 1 ||
+            observedMaxContacts != 1)
         {
             Reset();
             return default;
         }
 
-        _candidate = new(point, ButtonIntent.Left, observedMaxContacts);
+        _candidate = new(
+            point,
+            ButtonIntent.Left,
+            observedMaxContacts,
+            movementThresholdPixels);
         _state = State.Candidate;
         return new(true);
     }
 
-    private TouchMouseDecision HandleRightDown(Point point, bool snapshotIsRecent, int observedMaxContacts)
+    private TouchMouseDecision HandleRightDown(
+        Point point,
+        bool snapshotIsRecent,
+        int observedActiveContacts,
+        int observedMaxContacts,
+        int movementThresholdPixels)
     {
+        if (_state == State.ReplayedDrag && _candidate is { } replayed)
+        {
+            var release = new TouchMouseDecision(
+                true,
+                TouchMouseAction.EndLeftDrag,
+                replayed.StartPoint,
+                replayed.LastPoint);
+            Reset();
+            return release;
+        }
+
         if (_state == State.Candidate && _candidate is { } existing)
         {
             existing.Intent = ButtonIntent.Right;
@@ -108,10 +157,16 @@ internal sealed class TouchMouseStateMachine
             return new(true);
         }
 
-        if (!snapshotIsRecent || observedMaxContacts != 1)
+        if (!snapshotIsRecent ||
+            observedActiveContacts != 1 ||
+            observedMaxContacts != 1)
             return default;
 
-        _candidate = new(point, ButtonIntent.Right, observedMaxContacts);
+        _candidate = new(
+            point,
+            ButtonIntent.Right,
+            observedMaxContacts,
+            movementThresholdPixels);
         _state = State.Candidate;
         return new(true);
     }
@@ -121,8 +176,26 @@ internal sealed class TouchMouseStateMachine
         if (_candidate is not { } candidate)
             return default;
 
+        // Once the initial suppressed DOWN has been replayed, later promoted MOVE messages must
+        // pass through without changing the state. Changing ReplayedDrag to Canceled here loses
+        // the only information that a synthetic LEFTDOWN is still owned, so the eventual UP can
+        // no longer emit EndLeftDrag and Windows is left with the button held.
+        if (_state == State.ReplayedDrag && candidate.MaxContactCount == 1)
+            return default;
+
         if (candidate.MaxContactCount != 1)
         {
+            if (_state == State.ReplayedDrag)
+            {
+                var decision = new TouchMouseDecision(
+                    true,
+                    TouchMouseAction.EndLeftDrag,
+                    candidate.StartPoint,
+                    candidate.LastPoint);
+                Reset();
+                return decision;
+            }
+
             _state = State.Canceled;
             return default;
         }
@@ -223,12 +296,17 @@ internal sealed class TouchMouseStateMachine
         Right,
     }
 
-    private sealed class Candidate(Point startPoint, ButtonIntent intent, int maxContactCount)
+    private sealed class Candidate(
+        Point startPoint,
+        ButtonIntent intent,
+        int maxContactCount,
+        int movementThresholdPixels)
     {
         public Point StartPoint { get; } = startPoint;
         public Point LastPoint { get; set; } = startPoint;
         public ButtonIntent Intent { get; set; } = intent;
         public int MaxContactCount { get; set; } = maxContactCount;
+        public int MovementThresholdPixels { get; } = Math.Max(1, movementThresholdPixels);
         public bool MovementExceeded { get; set; }
     }
 }

@@ -12,6 +12,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly Icon _enabledIcon;
     private readonly ContextMenuStrip _contextMenu;
     private readonly NotifyIcon _trayIcon;
+    private readonly ToolStripMenuItem _diagnosticItem;
     private readonly ToolStripMenuItem _exitItem;
     private readonly ToolStripMenuItem _statusItem;
     private System.Windows.Forms.Timer? _deferredActionTimer;
@@ -37,9 +38,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _exitItem = new ToolStripMenuItem("退出");
         _exitItem.Click += (_, _) => RequestExit();
 
+        _diagnosticItem = new ToolStripMenuItem("保存最近输入诊断");
+        _diagnosticItem.Click += (_, _) => SaveDiagnosticTrace();
+
         _statusItem = new ToolStripMenuItem { Enabled = false };
         _contextMenu = new ContextMenuStrip();
         _contextMenu.Items.Add(_statusItem);
+        _contextMenu.Items.Add(_diagnosticItem);
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(_exitItem);
 
@@ -156,6 +161,25 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _inputHost.RequestStop();
         RuntimeLog.WriteAsync("收到退出请求；已停止拦截并请求输入线程有序退出。");
         ExitThread();
+    }
+
+    private void SaveDiagnosticTrace()
+    {
+        if (Volatile.Read(ref _exitRequested) != 0)
+            return;
+
+        if (!_inputHost.TryCaptureDiagnosticTrace(out string trace))
+        {
+            RuntimeLog.WriteAsync("无法从输入线程获取诊断快照。");
+            ShowStateNotification("保存失败，请稍后重试");
+            return;
+        }
+
+        string path = RuntimeLog.Write(
+            $"===== 最近输入诊断开始 ====={Environment.NewLine}" +
+            trace +
+            $"===== 最近输入诊断结束 =====");
+        ShowStateNotification($"输入诊断已保存：{Path.GetFileName(path)}");
     }
 
     private void ScheduleDeferredAction(PendingAction action, int delayMilliseconds)

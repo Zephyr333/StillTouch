@@ -16,6 +16,7 @@ internal sealed class InputThreadHost : IDisposable
     private const uint EnableMessage = 0x8000 + 0x61;
     private const uint DisableMessage = 0x8000 + 0x62;
     private const uint StopMessage = 0x8000 + 0x63;
+    private const uint CaptureTraceMessage = 0x8000 + 0x64;
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan GracefulStopTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan ControlMessageTimeout = TimeSpan.FromSeconds(1);
@@ -28,6 +29,7 @@ internal sealed class InputThreadHost : IDisposable
     private readonly ManualResetEventSlim _stopped = new(false);
     private readonly Thread _thread;
     private ExceptionDispatchInfo? _startupFailure;
+    private string? _capturedTrace;
     private GlobalTouchMouseService? _service;
     private nint _windowHandle;
     private int _controlMessageSucceeded;
@@ -89,6 +91,33 @@ internal sealed class InputThreadHost : IDisposable
             }
 
             return Volatile.Read(ref _controlMessageSucceeded) != 0;
+        }
+    }
+
+    public bool TryCaptureDiagnosticTrace(out string trace)
+    {
+        lock (_controlLock)
+        {
+            trace = string.Empty;
+            if (Volatile.Read(ref _stopRequested) != 0)
+                return false;
+
+            nint handle = Interlocked.CompareExchange(ref _windowHandle, 0, 0);
+            if (handle == 0)
+                return false;
+
+            _capturedTrace = null;
+            Volatile.Write(ref _controlMessageSucceeded, 0);
+            _controlMessageCompleted.Reset();
+            if (!PostMessage(handle, CaptureTraceMessage, 0, 0) ||
+                !_controlMessageCompleted.WaitOne(ControlMessageTimeout))
+            {
+                return false;
+            }
+
+            trace = _capturedTrace ?? string.Empty;
+            return Volatile.Read(ref _controlMessageSucceeded) != 0 &&
+                trace.Length > 0;
         }
     }
 
@@ -239,6 +268,33 @@ internal sealed class InputThreadHost : IDisposable
                 Volatile.Read(ref _service)?.StopAcceptingInput();
                 Application.ExitThread();
                 break;
+            case CaptureTraceMessage when Volatile.Read(ref _stopRequested) == 0:
+                CaptureDiagnosticTrace();
+                break;
+        }
+    }
+
+    private void CaptureDiagnosticTrace()
+    {
+        bool succeeded = false;
+        try
+        {
+            GlobalTouchMouseService? service = Volatile.Read(ref _service);
+            if (service is not null)
+            {
+                _capturedTrace = service.CaptureDiagnosticTrace();
+                succeeded = true;
+            }
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            _capturedTrace = null;
+            ReportDiagnosticSafely($"生成输入诊断快照失败：{ex}");
+        }
+        finally
+        {
+            Volatile.Write(ref _controlMessageSucceeded, succeeded ? 1 : 0);
+            _controlMessageCompleted.Set();
         }
     }
 
@@ -300,7 +356,7 @@ internal sealed class InputThreadHost : IDisposable
         protected override void WndProc(ref Message message)
         {
             uint id = unchecked((uint)message.Msg);
-            if (id is EnableMessage or DisableMessage or StopMessage)
+            if (id is EnableMessage or DisableMessage or StopMessage or CaptureTraceMessage)
             {
                 _handleMessage(id);
                 message.Result = 0;

@@ -1,60 +1,76 @@
 namespace StillTouch.Core;
 
 /// <summary>
-/// Suppresses the compatibility mouse button messages that Windows may emit after a raw touch
-/// click has already been converted. A new touch-derived left-down is always a new physical
-/// sequence, even when it arrives before the corresponding raw HID report.
+/// Keeps touch-promoted mouse button suppression balanced. An UP may be suppressed only when this
+/// service suppressed the matching DOWN. Raw HID and promoted mouse events have no shared contact
+/// identifier, so an otherwise ambiguous button message must remain fail-open.
 /// </summary>
 internal sealed class PromotedMouseSuppressionState
 {
-    internal const int WindowMilliseconds = 2000;
-
-    private long _sequence = -1;
-    private long _expiresAtMilliseconds;
-
-    public void MarkRawClick(long sequence, long nowMilliseconds)
-    {
-        _sequence = sequence;
-        _expiresAtMilliseconds = nowMilliseconds + WindowMilliseconds;
-    }
+    private ButtonLifecycle _left;
+    private ButtonLifecycle _right;
 
     public bool ShouldSuppress(
         TouchMouseMessage message,
-        long currentRawSequence,
-        long nowMilliseconds,
         bool isReplayedDrag)
     {
-        // The first promoted left-down of the next touch can precede its raw HID Down report.
-        // Treat it as the sequence boundary so rapid taps at exactly the same coordinate are not
-        // mistaken for a duplicate of the previous click.
-        if (message == TouchMouseMessage.LeftDown)
-        {
-            Clear();
-            return false;
-        }
-
-        // A replayed drag owns an injected left-down and must always receive an explicit up.
         if (message == TouchMouseMessage.LeftUp && isReplayedDrag)
         {
-            Clear();
+            _left = default;
             return false;
         }
 
-        return IsButtonMessage(message) &&
-            _sequence == currentRawSequence &&
-            nowMilliseconds <= _expiresAtMilliseconds;
+        ref ButtonLifecycle lifecycle = ref GetLifecycle(message, out bool isDown, out bool isUp);
+        if (isDown)
+        {
+            // Never guess that an ambiguous DOWN belongs to an earlier raw contact. If an
+            // abnormal second DOWN arrives before the first UP, RecordDecision keeps any earlier
+            // released DOWN sticky so the eventual UP cannot be swallowed.
+            return false;
+        }
+
+        if (!isUp)
+            return false;
+
+        bool suppress = lifecycle.DownWasObserved && lifecycle.DownWasSuppressed;
+        lifecycle = default;
+        return suppress;
+    }
+
+    public void RecordDecision(TouchMouseMessage message, bool suppressed)
+    {
+        ref ButtonLifecycle lifecycle = ref GetLifecycle(message, out bool isDown, out _);
+        if (isDown)
+        {
+            lifecycle = new(
+                DownWasObserved: true,
+                DownWasSuppressed:
+                    lifecycle.DownWasObserved
+                        ? lifecycle.DownWasSuppressed && suppressed
+                        : suppressed);
+        }
     }
 
     public void Clear()
     {
-        _sequence = -1;
-        _expiresAtMilliseconds = 0;
+        _left = default;
+        _right = default;
     }
 
-    private static bool IsButtonMessage(TouchMouseMessage message) =>
-        message is
-            TouchMouseMessage.LeftDown or
-            TouchMouseMessage.LeftUp or
-            TouchMouseMessage.RightDown or
-            TouchMouseMessage.RightUp;
+    private ref ButtonLifecycle GetLifecycle(
+        TouchMouseMessage message,
+        out bool isDown,
+        out bool isUp)
+    {
+        isDown = message is TouchMouseMessage.LeftDown or TouchMouseMessage.RightDown;
+        isUp = message is TouchMouseMessage.LeftUp or TouchMouseMessage.RightUp;
+        if (message is TouchMouseMessage.RightDown or TouchMouseMessage.RightUp)
+            return ref _right;
+
+        return ref _left;
+    }
+
+    private readonly record struct ButtonLifecycle(
+        bool DownWasObserved,
+        bool DownWasSuppressed);
 }

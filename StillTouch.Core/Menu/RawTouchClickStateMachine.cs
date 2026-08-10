@@ -33,7 +33,14 @@ internal enum RawTouchClickAction
 internal readonly record struct RawTouchClickDecision(
     RawTouchClickAction Action,
     Point Position,
-    long Sequence);
+    long Sequence,
+    long SourceTimestampMilliseconds = 0,
+    nint DeviceHandle = default,
+    long StreamEpoch = 0,
+    long FrameEpoch = 0,
+    int ContactId = 0,
+    long ContactGeneration = 0,
+    uint ScanTime = 0);
 
 internal sealed class RawTouchClickStateMachine
 {
@@ -90,6 +97,8 @@ internal sealed class RawTouchClickStateMachine
                     change.ContactId,
                     change.ContactGeneration,
                     change.RawStreamEpoch,
+                    change.FrameEpoch,
+                    change.ScanTime,
                     change.Position,
                     change.TimestampMilliseconds,
                     movementThresholdPixels,
@@ -116,6 +125,8 @@ internal sealed class RawTouchClickStateMachine
         {
             candidate.ActiveContactCount = change.ActiveContactCount;
             candidate.LastPoint = change.Position;
+            candidate.LastFrameEpoch = change.FrameEpoch;
+            candidate.LastScanTime = change.ScanTime;
             candidate.IsCanceled |= IsBeyondThreshold(
                 candidate.StartPoint,
                 change.Position,
@@ -139,7 +150,14 @@ internal sealed class RawTouchClickStateMachine
         return new(
             RawTouchClickAction.LeftClick,
             candidate.LastPoint,
-            _sequence);
+            _sequence,
+            change.TimestampMilliseconds,
+            change.DeviceHandle,
+            change.RawStreamEpoch,
+            change.FrameEpoch,
+            change.ContactId,
+            change.ContactGeneration,
+            change.ScanTime);
     }
 
     public RawTouchClickDecision TryTriggerLongPress(long nowMilliseconds)
@@ -160,13 +178,21 @@ internal sealed class RawTouchClickStateMachine
         return new(
             RawTouchClickAction.RightClick,
             candidate.LastPoint,
-            _sequence);
+            _sequence,
+            candidate.LongPressDueMilliseconds,
+            candidate.DeviceHandle,
+            candidate.RawStreamEpoch,
+            candidate.LastFrameEpoch,
+            candidate.ContactId,
+            candidate.ContactGeneration,
+            candidate.LastScanTime);
     }
 
     public bool TryAdoptNativeClick(
         RawTouchClickAction nativeAction,
         Point position,
         long nowMilliseconds,
+        long sourceTimestampMilliseconds,
         out RawTouchClickDecision decision)
     {
         decision = default;
@@ -187,7 +213,17 @@ internal sealed class RawTouchClickStateMachine
                 ? RawTouchClickAction.RightClick
                 : RawTouchClickAction.LeftClick;
         candidate.InjectedAction = action;
-        decision = new(action, position, _sequence);
+        decision = new(
+            action,
+            position,
+            _sequence,
+            sourceTimestampMilliseconds,
+            candidate.DeviceHandle,
+            candidate.RawStreamEpoch,
+            candidate.LastFrameEpoch,
+            candidate.ContactId,
+            candidate.ContactGeneration,
+            candidate.LastScanTime);
         return true;
     }
 
@@ -218,6 +254,8 @@ internal sealed class RawTouchClickStateMachine
         int contactId,
         long contactGeneration,
         long rawStreamEpoch,
+        long frameEpoch,
+        uint scanTime,
         Point startPoint,
         long startedAtMilliseconds,
         int movementThresholdPixels,
@@ -228,6 +266,8 @@ internal sealed class RawTouchClickStateMachine
         public int ContactId { get; } = contactId;
         public long ContactGeneration { get; } = contactGeneration;
         public long RawStreamEpoch { get; } = rawStreamEpoch;
+        public long LastFrameEpoch { get; set; } = frameEpoch;
+        public uint LastScanTime { get; set; } = scanTime;
         public Point StartPoint { get; } = startPoint;
         public Point LastPoint { get; set; } = startPoint;
         public long LongPressDueMilliseconds { get; } =

@@ -29,10 +29,13 @@ internal sealed class RawContactLifecycleTracker
         long frameEpoch,
         uint scanTime,
         List<RawDecodedContact> contacts,
-        long timestampMilliseconds,
+        long changeTimestampMilliseconds,
         List<TouchContactChange> changes,
-        long rawStreamEpoch = 0)
+        long rawStreamEpoch = 0,
+        long? snapshotTimestampMilliseconds = null)
     {
+        long snapshotTimestamp =
+            snapshotTimestampMilliseconds ?? changeTimestampMilliseconds;
         changes.Clear();
         _frameContacts.Clear();
 
@@ -46,7 +49,7 @@ internal sealed class RawContactLifecycleTracker
             if (!_frameContacts.Add(key))
             {
                 // Fail open: preserve the last known lifecycle and publish no synthetic change.
-                return CreateSnapshot(timestampMilliseconds);
+                return CreateSnapshot(snapshotTimestamp);
             }
         }
 
@@ -93,7 +96,7 @@ internal sealed class RawContactLifecycleTracker
                     contact.Position,
                     _active.Count,
                     _maximumContactCount,
-                    timestampMilliseconds,
+                    changeTimestampMilliseconds,
                     deviceHandle,
                     frameEpoch,
                     scanTime,
@@ -108,7 +111,7 @@ internal sealed class RawContactLifecycleTracker
                     contact.Position,
                     _active.Count,
                     _maximumContactCount,
-                    timestampMilliseconds,
+                    changeTimestampMilliseconds,
                     deviceHandle,
                     frameEpoch,
                     scanTime,
@@ -117,7 +120,7 @@ internal sealed class RawContactLifecycleTracker
             }
         }
 
-        TouchContactSnapshot snapshot = CreateSnapshot(timestampMilliseconds);
+        TouchContactSnapshot snapshot = CreateSnapshot(snapshotTimestamp);
         if (_active.Count == 0)
             _maximumContactCount = 0;
         return snapshot;

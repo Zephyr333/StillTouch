@@ -120,13 +120,16 @@ var tests = new (string Name, Action Run)[]
     ("raw duplicate contact frame is atomic", RawDuplicateContactFrameIsAtomic),
     ("raw replacement frame order cannot click", RawReplacementFrameOrderCannotClick),
     ("raw contact ids are scoped and reused safely", RawContactIdsAreScopedAndReusedSafely),
+    ("raw event and observation clocks stay separate", RawEventAndObservationClocksStaySeparate),
     ("stale raw up cannot finish reused contact", StaleRawUpCannotFinishReusedContact),
     ("unknown generation cannot finish known contact", UnknownGenerationCannotFinishKnownContact),
     ("old stream cannot finish resynchronized contact", OldStreamCannotFinishResynchronizedContact),
     ("same-id same-position raw taps remain two clicks", SameIdSamePositionRawTapsRemainTwoClicks),
     ("bounded input trace overwrites without allocation", BoundedInputTraceOverwritesWithoutAllocation),
+    ("input trace preserves source latency", InputTracePreservesSourceLatency),
     ("same-position rapid taps stay independent", SamePositionRapidTapsStayIndependent),
-    ("next promoted down escapes stale suppression", NextPromotedDownEscapesStaleSuppression),
+    ("released promoted down keeps matching up", ReleasedPromotedDownKeepsMatchingUp),
+    ("suppressed promoted buttons stay paired", SuppressedPromotedButtonsStayPaired),
     ("drag up escapes raw suppression", DragUpEscapesRawSuppression),
     ("partial SendInput owns only injected button", PartialSendInputTracksOwnedButton),
     ("zero SendInput owns no button", ZeroSendInputOwnsNoButton),
@@ -453,6 +456,8 @@ static void RawTapWithoutNativePromotion()
 
     Assert(click.Action == RawTouchClickAction.LeftClick, "raw touch-up must create a left click without native mouse messages");
     Assert(click.Position == new Point(102, 201), "raw click must use the final touch coordinate");
+    Assert(click.SourceTimestampMilliseconds == 1060,
+        "raw click latency must be measured from the physical Up report timestamp");
 }
 
 static void RawLongPressWithoutNativeRightClick()
@@ -464,6 +469,8 @@ static void RawLongPressWithoutNativeRightClick()
     var rightClick = machine.TryTriggerLongPress(2450);
     var up = machine.Process(Contact(1, TouchContactChangeKind.Up, 300, 400, 0, 1, 2500), 12);
     Assert(rightClick.Action == RawTouchClickAction.RightClick, "stationary hold must create a right click without native promotion");
+    Assert(rightClick.SourceTimestampMilliseconds == 2450,
+        "long-press latency must be measured from its due time");
     Assert(up.Action == RawTouchClickAction.None, "lifting after a long press must not add a left click");
 }
 
@@ -1139,6 +1146,26 @@ static void SameIdSamePositionRawTapsRemainTwoClicks()
         "immediate ContactId reuse must create an independent click sequence");
 }
 
+static void RawEventAndObservationClocksStaySeparate()
+{
+    var lifecycle = new RawContactLifecycleTracker();
+    var changes = new List<TouchContactChange>();
+    TouchContactSnapshot snapshot = lifecycle.ProcessFrame(
+        new nint(0x404),
+        frameEpoch: 1,
+        scanTime: 100,
+        contacts: [new RawDecodedContact(7, true, new Point(20, 30))],
+        changeTimestampMilliseconds: 10_000,
+        changes: changes,
+        rawStreamEpoch: 2,
+        snapshotTimestampMilliseconds: 10_400);
+
+    Assert(changes.Count == 1 && changes[0].TimestampMilliseconds == 10_000,
+        "raw decisions must retain the source WM_INPUT event time for latency measurement");
+    Assert(snapshot.UpdatedAtMilliseconds == 10_400,
+        "touch snapshot freshness must use the handler observation time");
+}
+
 static void BoundedInputTraceOverwritesWithoutAllocation()
 {
     var trace = new InputTraceBuffer(capacity: 128);
@@ -1169,6 +1196,18 @@ static void BoundedInputTraceOverwritesWithoutAllocation()
         "the exported trace omitted its performance or overwrite summary");
 }
 
+static void InputTracePreservesSourceLatency()
+{
+    Assert(InputTraceBuffer.GetEventTimestampMilliseconds(10_050, 50) == 10_000,
+        "message queue delay must recover the original event timestamp");
+    Assert(InputTraceBuffer.GetEventTimestampMilliseconds(10_050, -1) == 10_050,
+        "an unavailable message timestamp must fail open to the observation time");
+    Assert(InputTraceBuffer.GetElapsedMilliseconds(10_000, 10_075) == 75,
+        "source-to-injection delay must retain elapsed milliseconds");
+    Assert(InputTraceBuffer.GetElapsedMilliseconds(10_100, 10_075) == -1,
+        "an invalid future source timestamp must be reported as unavailable");
+}
+
 static void SamePositionRapidTapsStayIndependent()
 {
     var machine = new RawTouchClickStateMachine();
@@ -1182,25 +1221,37 @@ static void SamePositionRapidTapsStayIndependent()
     Assert(second.Sequence == first.Sequence + 1, "rapid taps must use independent suppression sequences");
 }
 
-static void NextPromotedDownEscapesStaleSuppression()
+static void ReleasedPromotedDownKeepsMatchingUp()
 {
     var suppression = new PromotedMouseSuppressionState();
-    suppression.MarkRawClick(7, 5000);
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftDown, false),
+        "an ambiguous promoted down must remain fail-open");
+    suppression.RecordDecision(TouchMouseMessage.LeftDown, suppressed: false);
+    suppression.RecordDecision(TouchMouseMessage.LeftDown, suppressed: true);
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, false),
+        "a released promoted down must keep the eventual up fail-open even after an abnormal second down");
+}
 
-    Assert(suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 7, 5050, false),
-        "the duplicate up from the converted raw click must be suppressed");
-    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftDown, 7, 5100, false),
-        "a new promoted down must start a new tap even before the raw sequence advances");
-    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 7, 5140, false),
-        "clearing at the new down must keep its matching up available to the fallback path");
+static void SuppressedPromotedButtonsStayPaired()
+{
+    var suppression = new PromotedMouseSuppressionState();
+    suppression.RecordDecision(TouchMouseMessage.LeftDown, suppressed: true);
+    Assert(suppression.ShouldSuppress(TouchMouseMessage.LeftUp, false),
+        "a suppressed promoted left down requires a suppressed matching up");
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, false),
+        "an extra promoted left up must remain fail-open after the pair is complete");
+
+    suppression.RecordDecision(TouchMouseMessage.RightDown, suppressed: true);
+    Assert(suppression.ShouldSuppress(TouchMouseMessage.RightUp, false),
+        "right-button suppression must be paired independently");
 }
 
 static void DragUpEscapesRawSuppression()
 {
     var suppression = new PromotedMouseSuppressionState();
-    suppression.MarkRawClick(9, 6000);
+    suppression.RecordDecision(TouchMouseMessage.LeftDown, suppressed: true);
 
-    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, 9, 6050, true),
+    Assert(!suppression.ShouldSuppress(TouchMouseMessage.LeftUp, true),
         "raw click suppression must never swallow the up for an injected drag down");
 }
 
@@ -1973,11 +2024,18 @@ static void NativeFallbackCannotDuplicateRawClick()
 {
     var machine = new RawTouchClickStateMachine();
     _ = machine.Process(Contact(1, TouchContactChangeKind.Down, 40, 50, 1, 1, 6000), 12);
-    Assert(machine.TryAdoptNativeClick(RawTouchClickAction.LeftClick, new(40, 50), 6040, out var adopted),
+    Assert(machine.TryAdoptNativeClick(
+            RawTouchClickAction.LeftClick,
+            new(40, 50),
+            6040,
+            6038,
+            out var adopted),
         "native click should be adopted while raw contact is pending");
     var rawUp = machine.Process(Contact(1, TouchContactChangeKind.Up, 40, 50, 0, 1, 6050), 12);
 
     Assert(adopted.Action == RawTouchClickAction.LeftClick, "adopted click must preserve button intent");
+    Assert(adopted.SourceTimestampMilliseconds == 6038,
+        "adopted native click must retain its hook-message timestamp");
     Assert(rawUp.Action == RawTouchClickAction.None, "raw completion must not duplicate an adopted native click");
 }
 

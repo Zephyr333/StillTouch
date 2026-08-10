@@ -24,6 +24,7 @@ internal readonly record struct InputTraceEntry(
     nint DeviceHandle = default,
     long StreamEpoch = 0,
     long FrameEpoch = 0,
+    long Sequence = 0,
     int ContactId = 0,
     long ContactGeneration = 0,
     uint ScanTime = 0,
@@ -77,7 +78,11 @@ internal sealed class InputTraceBuffer(int capacity = 4096)
         AppendPerformanceSummary(builder, snapshot, InputTraceKind.PromotedMouse, "hook");
         AppendPerformanceSummary(builder, snapshot, InputTraceKind.Injection, "sendinput");
         builder.AppendLine(
-            "tick_ms\tkind\tduration_us\tallocated_B\tqueue_ms\tdevice\tstream\tframe\tcontact\tgeneration\tscan\tx\ty\tactive\tmax\tcode\tresult");
+            "delay_ms: RawHandler/PromotedMouse = message queue; Injection = source event to SendInput start.");
+        builder.AppendLine(
+            "Injection code: 1/2 = raw left/right; 101/102 = promoted fallback left/right; 103-105 = drag. PromotedMouse result bits: 0x100 = suppressed, 0x200 = paired with a suppressed down.");
+        builder.AppendLine(
+            "tick_ms\tkind\tduration_us\tallocated_B\tdelay_ms\tdevice\tstream\tframe\tsequence\tcontact\tgeneration\tscan\tx\ty\tactive\tmax\tcode\tresult");
 
         for (int index = 0; index < snapshot.Length; index++)
         {
@@ -90,6 +95,7 @@ internal sealed class InputTraceBuffer(int capacity = 4096)
                 .Append("0x").Append(unchecked((nuint)entry.DeviceHandle).ToString("X")).Append('\t')
                 .Append(entry.StreamEpoch).Append('\t')
                 .Append(entry.FrameEpoch).Append('\t')
+                .Append(entry.Sequence).Append('\t')
                 .Append(entry.ContactId).Append('\t')
                 .Append(entry.ContactGeneration).Append('\t')
                 .Append(entry.ScanTime).Append('\t')
@@ -126,6 +132,28 @@ internal sealed class InputTraceBuffer(int capacity = 4096)
         uint now = unchecked((uint)Environment.TickCount);
         uint elapsed = unchecked(now - eventTimeMilliseconds);
         return elapsed <= 60_000 ? (int)elapsed : -1;
+    }
+
+    internal static long GetEventTimestampMilliseconds(
+        long observedAtMilliseconds,
+        int queueDelayMilliseconds) =>
+        queueDelayMilliseconds >= 0
+            ? observedAtMilliseconds - queueDelayMilliseconds
+            : observedAtMilliseconds;
+
+    internal static int GetElapsedMilliseconds(
+        long sourceTimestampMilliseconds,
+        long observedAtMilliseconds)
+    {
+        if (sourceTimestampMilliseconds <= 0 ||
+            observedAtMilliseconds < sourceTimestampMilliseconds)
+        {
+            return -1;
+        }
+
+        return (int)Math.Min(
+            observedAtMilliseconds - sourceTimestampMilliseconds,
+            int.MaxValue);
     }
 
     private static void AppendPerformanceSummary(

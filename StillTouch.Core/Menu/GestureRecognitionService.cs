@@ -276,12 +276,16 @@ public sealed class GestureRecognitionService : IDisposable
     {
         long started = Stopwatch.GetTimestamp();
         long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        long observedAtMilliseconds = Environment.TickCount64;
         int queueDelay = InputTraceBuffer.GetQueueDelayMilliseconds(
             unchecked((uint)PInvoke.GetMessageTime()));
+        long eventTimestampMilliseconds = InputTraceBuffer.GetEventTimestampMilliseconds(
+            observedAtMilliseconds,
+            queueDelay);
         int result = 0;
         try
         {
-            if (!TryReadRawInput(rawInputHandle))
+            if (!TryReadRawInput(rawInputHandle, eventTimestampMilliseconds))
                 InvalidateAllRawStreams();
             else
                 result = 1;
@@ -298,7 +302,9 @@ public sealed class GestureRecognitionService : IDisposable
         }
     }
 
-    private unsafe bool TryReadRawInput(nint rawInputHandle)
+    private unsafe bool TryReadRawInput(
+        nint rawInputHandle,
+        long eventTimestampMilliseconds)
     {
         uint size = 0;
         uint headerSize = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
@@ -411,7 +417,10 @@ public sealed class GestureRecognitionService : IDisposable
                     hasScanTime,
                     scanTime,
                     ReadOnlySpan<RawDecodedContact>.Empty);
-                HandleRawFrameResult(deviceHandle, emptyResult);
+                HandleRawFrameResult(
+                    deviceHandle,
+                    emptyResult,
+                    eventTimestampMilliseconds);
                 continue;
             }
 
@@ -436,7 +445,10 @@ public sealed class GestureRecognitionService : IDisposable
                 hasScanTime,
                 scanTime,
                 device.ContactScratch.AsSpan(0, contactsInPacket));
-            HandleRawFrameResult(deviceHandle, result);
+            HandleRawFrameResult(
+                deviceHandle,
+                result,
+                eventTimestampMilliseconds);
         }
 
         return true;
@@ -444,7 +456,8 @@ public sealed class GestureRecognitionService : IDisposable
 
     private void HandleRawFrameResult(
         nint deviceHandle,
-        RawTouchFrameResult result)
+        RawTouchFrameResult result,
+        long eventTimestampMilliseconds)
     {
         _trace.Record(new(
             Environment.TickCount64,
@@ -517,7 +530,8 @@ public sealed class GestureRecognitionService : IDisposable
             result.FrameEpoch,
             result.ScanTime,
             completedContacts,
-            stream.StreamEpoch);
+            stream.StreamEpoch,
+            eventTimestampMilliseconds);
     }
 
     private void InvalidateRawStream(nint deviceHandle)
@@ -1036,17 +1050,18 @@ public sealed class GestureRecognitionService : IDisposable
         long frameEpoch,
         uint scanTime,
         List<RawDecodedContact> contacts,
-        long rawStreamEpoch)
+        long rawStreamEpoch,
+        long eventTimestampMilliseconds)
     {
-        long timestamp = Environment.TickCount64;
         CurrentTouchSnapshot = _rawLifecycles.ProcessFrame(
             deviceHandle,
             frameEpoch,
             scanTime,
             contacts,
-            timestamp,
+            eventTimestampMilliseconds,
             _rawChanges,
-            rawStreamEpoch);
+            rawStreamEpoch,
+            snapshotTimestampMilliseconds: Environment.TickCount64);
         for (int index = 0; index < _rawChanges.Count; index++)
         {
             TouchContactChange change = _rawChanges[index];
